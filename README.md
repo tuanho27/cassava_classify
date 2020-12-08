@@ -6,6 +6,6 @@ Create environment
     pytorch 1.6
     jupyter lab
     albumentation
-    timm
+    timm 0.3.1
 ```
 
