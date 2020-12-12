@@ -25,7 +25,7 @@ cudnn.benchmark = True
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, CosineAnnealingLR, ReduceLROnPlateau
 import timm
 from timm.loss import JsdCrossEntropy
-from utils import Mixup, RandAugment, AsymmetricLossSingleLabel, SCELoss, LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
+from utils import Mixup, RandAugment, AsymmetricLossSingleLabel, SCELoss, LabelSmoothingCrossEntropy, SoftTargetCrossEntropy, fmix
 from PIL import Image
 SEED = 42
 
@@ -178,7 +178,7 @@ def calculate_accuracy(output, target):
 #     return torch.true_divide((target == output).sum(dim=0), output.size(0)).item()
     if params["mix_up"]:
         output = torch.argmax(torch.softmax(output, dim=1), dim=1)
-        return accuracy_score(output.cpu(), target.argmax(1).cpu())
+        return accuracy_score(output.cpu(), target.cpu())
     
     output = torch.softmax(output, dim=1)
     return accuracy_score(output.argmax(1).cpu(), target.cpu())
@@ -233,7 +233,7 @@ def update_hard_sample(train_loader, model, val_criterion, thres):
                 label=train_loss_list['label'],
                 fold=train_loss_list['fold'])
 
-def train_epoch(train_loader, model, criterion, optimizer, epoch, params):
+def train_epoch(train_loader, model, criterion, optimizer, epoch, params, criterion_fmix=None):
     metric_monitor = MetricMonitor()
     model.train()
     if params["hard_negative_sample"]:
@@ -241,16 +241,30 @@ def train_epoch(train_loader, model, criterion, optimizer, epoch, params):
     else:
         stream = tqdm(train_loader)
     for i, (images, target, _) in enumerate(stream, start=1):
+        mix_decision = np.random.rand()
+
         images = images.to(params["device"]) #, non_blocking=True)
         target = target.to(params["device"]) #, non_blocking=True) #.view(-1,params['batch_size'])
-        if params["mix_up"]:
-            images , target = mixup_fn(images, target)
+        if mix_decision < 0.25:
+            if params["mix_up"]:
+                images , mtarget = mixup_fn(images, target)
+        elif mix_decision >=0.25 and mix_decision < 0.5:
+            if params["fmix"]:
+                images , ftarget = fmix(images, target, alpha=1., decay_power=5.,
+                                    shape=(params["image_size"],params["image_size"]),
+                                    device=params["device"])
         output = model(images)
         if isinstance(output, (tuple, list)):
             output = output[0]
-        loss = criterion(output, target)
+            
+        if mix_decision < 0.25:
+            loss = criterion(output, mtarget)
+        else:
+            loss = criterion_fmix(output, ftarget[0]) * ftarget[2] + criterion_fmix(output, ftarget[1]) * (1. - ftarget[2])
+            
         # loss1 = symetric_criterion(output, target)
         # loss2 = asymetric_criterion(output, target)
+        
         if params['gradient_accumulation_steps'] > 1:
             loss = loss / params['gradient_accumulation_steps']
     
@@ -308,52 +322,52 @@ if __name__ == "__main__":
     label_map = pd.read_json(f'{root}/label_num_to_disease_map.json', 
                             orient='index')
 
-    models_name = ["resnest26d","resnest50d","tf_efficientnet_b3_ns", "skresnet34" ,"cspresnet50", "vit_base_patch16_384"]
+    models_name = ["resnest26d","resnest50d","tf_efficientnet_b3_ns" , "vit_base_patch16_384"]
     WEIGHTS = [
-        "weights/resnest26d/resnest26d_fold0_best_epoch_28_final_1st.pth",
-        "weights/resnest26d/resnest26d_fold0_best_epoch_13_final_mixup.pth",
-        "weights/resnest26d/resnest26d_fold2_best_epoch_3_final_hnm.pth",
-        "weights/resnest26d/resnest26d_fold4_best_epoch_29_1st.pth",
-        "weights/resnest26d/resnest26d_fold4_best_epoch_26_mix.pth",
-        "weights/resnest26d/resnest26d_fold4_best_epoch_12_cutmix.pth",
-        "weights/resnest26d/resnest26d_fold4_best_epoch_3_external.pth",
-        "weights/resnest26d/resnest26d_fold4_best_epoch_21_final_512.pth",
-        "weights/tf_efficientnet_b3_ns/tf_efficientnet_b3_ns_fold1_best_epoch_19_external.pth",
-        "weights/tf_efficientnet_b3_ns/tf_efficientnet_b3_ns_fold1_best_epoch_26_512.pth",
-        "weights/tf_efficientnet_b3_ns/tf_efficientnet_b3_ns_fold1_best_epoch_1_final_512.pth",
-        "weights/resnest50d/resnest50d_fold1_best_epoch_95_final_1st.pth",
-    #     "weights/resnest50d/resnest50d_fold1_best_epoch_9_final_512.pth"
-        "weights/resnest50d/resnest50d_fold1_best_epoch_38_clean_1st.pth"
+        # "./weights/resnest50d/resnest50d_fold0_best_epoch_30_final_2nd.pth",
+        # "./weights/resnest50d/resnest50d_fold1_best_epoch_17_final_2nd.pth",
+        # "./weights/resnest50d/resnest50d_fold2_best_epoch_22_final_2nd.pth",
+        # "./weights/resnest50d/resnest50d_fold3_best_epoch_2_final_2nd.pth",
+        # "./weights/resnest50d/resnest50d_fold4_best_epoch_10_final_2nd.pth",
+        
+        "./weights/resnest26d/resnest26d_fold0_best_epoch_4_final_2nd.pth",
+        "./weights/resnest26d/resnest26d_fold1_best_epoch_7_final_2nd.pth",
+        "./weights/resnest26d/resnest26d_fold2_best_epoch_4_final_2nd.pth",
+        "./weights/resnest26d/resnest26d_fold3_best_epoch_15_final_2nd.pth",
+        "./weights/resnest26d/resnest26d_fold4_best_epoch_21_final_2nd.pth",
+
+        # "weights/resnest50d/resnest50d_fold1_best_epoch_38_clean_1st.pth"
             
     ]
     model_index = 0
-    ckpt_index = 1
+    ckpt_index = 5
     fold_ckpt_index = [11,12]
     fold_ckpt_weight = [1,1]
 
     params = {
         "visualize": False,
         "fold": [0,1,2,3,4],
-        "train_external": False,
+        "train_external": True,
         "train_clean_only": False,
         "test_external": False,
-        "load_pretrained": False,
+        "load_pretrained": True,
         "resume": False,
-        "image_size": 320,
+        "image_size": 512,
         "num_classes": 5,
         "model": models_name[model_index],
         "device": "cuda",
-        "lr": 1e-3,
+        "lr": 1e-4,
         "lr_min":1e-7,
-        "batch_size": 2,
-        "num_workers": 1,
-        "epochs": 10,
+        "batch_size": 8,
+        "num_workers": 4,
+        "epochs": 20,
         "gradient_accumulation_steps": 1,
-        "drop_block": 0.1,
-        "drop_rate": 0.3,
-        "mix_up": False,
-        "cutmix":False,
-        "smooth_label": 0,
+        "drop_block": 0.2,
+        "drop_rate": 0.2,
+        "mix_up": True,
+        "cutmix":True,
+        "fmix": True,
+        "smooth_label": 0.1,
         "rand_aug": False,
         "local_rank":0,
         "distributed": False,
@@ -388,7 +402,7 @@ if __name__ == "__main__":
 
     model = model.to(params["device"])
     val_criterion = nn.CrossEntropyLoss().to(params["device"])
-    # criterion = nn.CrossEntropyLoss().to(params["device"])
+    criterion_fmix = nn.CrossEntropyLoss().to(params["device"])
     criterion = LabelSmoothingCrossEntropy().to(params["device"])
     if params["mix_up"]:
         criterion = SoftTargetCrossEntropy().to(params["device"])
@@ -443,9 +457,9 @@ if __name__ == "__main__":
     for n, (train_index, val_index) in enumerate(Fold.split(folds, folds['label'])):
         folds.loc[val_index, 'fold'] = int(n)
     folds['fold'] = folds['fold'].astype(int)
-    for i in params["fold"]:
-        print(f"Train Fold: {i}")
-        fold = params["fold"][i]
+    for i, fold_idx in enumerate(params["fold"]):
+        print(f"Train Fold: {fold_idx}")
+        fold = fold_idx
         train_idx = folds[folds['fold'] != fold].index
         val_idx = folds[folds['fold'] == fold].index
 
@@ -486,7 +500,7 @@ if __name__ == "__main__":
         )
 
         if params["load_pretrained"]:
-            state_dict = torch.load(WEIGHTS[ckpt_index])
+            state_dict = torch.load(WEIGHTS[i])
             print("Load pretrained model: ",state_dict["preds"])
             model.load_state_dict(state_dict["model"])
             best_acc = state_dict["preds"]
@@ -504,5 +518,5 @@ if __name__ == "__main__":
             best_acc = 0.
             
         for epoch in range(1, params["epochs"] + 1):
-            train_epoch(train_loader, model, criterion, optimizer, epoch, params)
+            train_epoch(train_loader, model, criterion, optimizer, epoch, params, criterion_fmix=criterion_fmix)
             best_acc = validate(val_loader, model, criterion, epoch, params, fold, best_acc)

@@ -41,7 +41,7 @@ def seed_everything(SEED):
     torch.backends.cudnn.benchmark = True
 seed_everything(SEED)
 
-os.environ['CUDA_VISIBLE_DEVICES'] ="0"
+os.environ['CUDA_VISIBLE_DEVICES'] ="0,1"
 
 
 def merge_data(df1, df2):
@@ -294,10 +294,12 @@ if __name__ == "__main__":
         # "./weights/resnest50d/resnest50d_fold2_best_epoch_50_final_1st.pth",
         # "./weights/resnest50d/resnest50d_fold3_best_epoch_2_final_2nd.pth",
         # "./weights/resnest50d/resnest50d_fold4_best_epoch_10_final_2nd.pth",
-        "./weights/resnest26d/resnest26d_fold0_best_epoch_4_final_512.pth",
-        "./weights/resnest26d/resnest26d_fold1_best_epoch_7_finale_ex_hnm.pth",
-        "./weights/resnest26d/resnest26d_fold2_best_epoch_4_final_512.pth",
-        "./weights/resnest26d/resnest26d_fold4_best_epoch_21_final_512.pth",
+        
+        "./weights/resnest26d/resnest26d_fold0_best_epoch_4_final_2nd.pth",
+        "./weights/resnest26d/resnest26d_fold1_best_epoch_7_final_2nd.pth",
+        "./weights/resnest26d/resnest26d_fold2_best_epoch_4_final_2nd.pth",
+        # "./weights/resnest26d/resnest26d_fold3_best_epoch_58.pth",
+        "./weights/resnest26d/resnest26d_fold4_best_epoch_21_final_2nd.pth",
     ]
     model_index = 0
     ckpt_index = 1
@@ -371,7 +373,7 @@ if __name__ == "__main__":
         
     val_transform = A.Compose(
         [
-            # A.CenterCrop(height=params["image_size"], width=params["image_size"], p=1),
+            A.CenterCrop(height=params["image_size"], width=params["image_size"], p=1),
             A.Resize(params["image_size"],params["image_size"]),
             A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
             ToTensorV2(),
@@ -379,7 +381,7 @@ if __name__ == "__main__":
     )
     transform_tta0 = A.Compose(
         [
-            # A.CenterCrop(height=params["image_size"], width=params["image_size"], p=1),    
+            A.CenterCrop(height=params["image_size"], width=params["image_size"], p=1),    
             A.Resize(height=params["image_size"], width=params["image_size"], p=1),
             A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),   
             ToTensorV2()
@@ -388,7 +390,7 @@ if __name__ == "__main__":
 
     transform_tta1 = A.Compose(
         [
-            # A.CenterCrop(height=params["image_size"], width=params["image_size"], p=1),
+            A.CenterCrop(height=params["image_size"], width=params["image_size"], p=1),
             A.Resize(height=params["image_size"], width=params["image_size"], p=1),
             A.HorizontalFlip(p=1.),
             A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),   
@@ -397,7 +399,7 @@ if __name__ == "__main__":
     )
     transform_tta2 = A.Compose(
         [
-            # A.CenterCrop(height=params["image_size"], width=params["image_size"], p=1),
+            A.CenterCrop(height=params["image_size"], width=params["image_size"], p=1),
             A.Resize(height=params["image_size"], width=params["image_size"], p=1),
             A.VerticalFlip(p=1.),
             A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
@@ -498,5 +500,5 @@ if __name__ == "__main__":
         model.load_state_dict(state_dict["model"])
 
         cv_acc += tta_validate(val_pred_loader, model, params)
-                
-    print(f"Done CV validation with accuracy: {round(cv_acc/5,4)}")
+    num_fold_train = len(params["fold"])            
+    print(f"Done CV validation with  {num_fold_train} folds, Accuracy: {round(cv_acc/num_fold_train,4)}")

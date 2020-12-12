@@ -7,5 +7,5 @@ from .custom_loss import *
 __all__ = ["Mixup", "RandAugment", "AutoAugment",
            "RAdam", "EvoNorm2D", 
            "SCELoss", "VarifocalSmoothLoss", "AsymmetricLossSingleLabel", 
-           "LabelSmoothingCrossEntropy", "SoftTargetCrossEntropy"
+           "LabelSmoothingCrossEntropy", "SoftTargetCrossEntropy", "fmix"
            ]
