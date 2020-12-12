@@ -21,6 +21,8 @@ import torchvision.models as models
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import accuracy_score
 from sklearn.utils import resample
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as T
 cudnn.benchmark = True
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, CosineAnnealingLR, ReduceLROnPlateau
 import timm
@@ -207,94 +209,71 @@ class MetricMonitor:
                 for (metric_name, metric) in self.metrics.items()
             ]
         )
+def gmean(input_x, dim):
+    log_x = torch.log(input_x)
+    return torch.exp(torch.mean(log_x, dim=dim))
 
-def update_hard_sample(train_loader, model, val_criterion, thres):
-    fig, ax = plt.subplots(nrows=1, ncols=3, figsize=(12, 6))
-    train_loss_list = {'image_id':[],
+def tta_validate(loader, model, params):
+    num_tta = len(test_transform_tta)
+    incorrect_pred_list = {'image_id':[],
                        'label':[],
-                       'loss':[],
-                       'fold':[]}
-    model.eval()
-    stream = tqdm(train_loader)
-    with torch.no_grad():
-        for i, (images, target, name) in enumerate(stream, start=1):
-            images = images.to(params["device"], non_blocking=True)
-            target = target.to(params["device"], non_blocking=True)#.view(-1,params['batch_size'])
-            output = model(images)
-            loss = val_criterion(output, target)
-            if loss > thres:
-                train_loss_list['image_id'].append(name[0])
-                train_loss_list['label'].append(int(target[0].cpu().numpy()))
-                train_loss_list['loss'].append(loss)
-                train_loss_list['fold'].append(params['fold'])
-    print("Number hard samples:",len(train_loss_list["loss"]))
-        
-    return dict(image_id=train_loss_list['image_id'],
-                label=train_loss_list['label'],
-                fold=train_loss_list['fold'])
-
-def train_epoch(train_loader, model, criterion, optimizer, epoch, params):
-    metric_monitor = MetricMonitor()
-    model.train()
-    if params["hard_negative_sample"]:
-        stream = tqdm(update_train_loader)
-    else:
-        stream = tqdm(train_loader)
-    for i, (images, target, _) in enumerate(stream, start=1):
-        images = images.to(params["device"]) #, non_blocking=True)
-        target = target.to(params["device"]) #, non_blocking=True) #.view(-1,params['batch_size'])
-        if params["mix_up"]:
-            images , target = mixup_fn(images, target)
-        output = model(images)
-        if isinstance(output, (tuple, list)):
-            output = output[0]
-        loss = criterion(output, target)
-        # loss1 = symetric_criterion(output, target)
-        # loss2 = asymetric_criterion(output, target)
-        if params['gradient_accumulation_steps'] > 1:
-            loss = loss / params['gradient_accumulation_steps']
-    
-        accuracy = calculate_accuracy(output, target)
-        metric_monitor.update("Loss", loss.item())
-        metric_monitor.update("Accuracy", accuracy)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        stream.set_description(
-            "Epoch: {epoch}. Train.      {metric_monitor}".format(epoch=epoch, metric_monitor=metric_monitor)
-        )
-
-
-def validate(val_loader, model, criterion, epoch, params, fold, best_acc):
+                       'pred':[],
+                       'prob':[]}
+    correct_pred_list = {'image_id':[],
+                       'label':[],
+                       'pred':[],
+                       'prob':[]}    
     metric_monitor = MetricMonitor()
     model.eval()
-    stream = tqdm(val_loader)
+    stream = tqdm(loader)
+    count_change = 0
     with torch.no_grad():
-        for i, (images, target, _) in enumerate(stream, start=1):
-            images = images.to(params["device"], non_blocking=True)
-            target = target.to(params["device"], non_blocking=True)#.view(-1,params['batch_size'])
-            output = model(images)
-            loss = val_criterion(output, target)
-            output = torch.softmax(output, dim = 1)
-            
-            accuracy = accuracy_score(output.argmax(1).cpu(), target.cpu())
+        for i, data in enumerate(stream, start=1):
+            if params["visualize"]:
+                visualize_tta(data, pred)
+            tta_output = []   
+            for i, image in enumerate(data["images"]):
+                out = torch.softmax(model(image), dim=1)
+                tta_output.append(out)
+            output = gmean(torch.stack(tta_output, dim=0), dim = 0)
+#             output = torch.softmax(tta_output, dim=1)
+            pred = output.argmax(1)
 
+            topk_output, topk_ids = torch.topk(output, params["num_classes"])
+            for i in range(len(data["labels"][0])):
+                if params["error_analysis"]:
+                    ## adjust the output prediction
+                    max_1st = topk_ids[i][0]
+                    max_2nd = topk_ids[i][1]
+                    if  max_1st == 0 and max_2nd == 4 and output[i][max_2nd] > 0.2:
+                        pred[i] = max_2nd
+                        count_change+=1
+                    if max_1st == 3 and max_2nd == 2 and output[i][max_2nd] > 0.2:
+                        pred[i] = max_2nd
+                        count_change+=1
+
+                    if output[i][max_1st] < 0.45 and output[i][max_2nd] > 0.25:
+                        pred[i] = max_2nd
+                        count_change+=1
+
+                if data["labels"][0][i] != output.argmax(1).cpu()[i]:
+                    incorrect_pred_list['image_id'].append(data["image_ids"][0][i])                        
+                    incorrect_pred_list['label'].append(data["labels"][0][i].cpu().numpy())
+                    incorrect_pred_list['pred'].append(output.argmax(1).cpu()[i].cpu().numpy())
+                    incorrect_pred_list['prob'].append(output[i].cpu().numpy())
+                else:
+                    correct_pred_list['image_id'].append(data["image_ids"][0][i])                        
+                    correct_pred_list['label'].append(data["labels"][0][i].cpu().numpy())
+                    correct_pred_list['pred'].append(output.argmax(1).cpu()[i].cpu().numpy())
+                    correct_pred_list['prob'].append(output[i].cpu().numpy())   
+            accuracy = accuracy_score(pred.cpu(), data["labels"][0].cpu())
+            metric_monitor.update("Accuracy", accuracy)            
             stream.set_description(
-                "Epoch: {epoch}. Validation. {metric_monitor}".format(epoch=epoch, metric_monitor=metric_monitor)
-            )           
-            metric_monitor.update("Loss", loss.item())
-            metric_monitor.update("Accuracy", accuracy)
-        #to save weight
-        if (metric_monitor.curr_acc > best_acc): # or epoch == params["epochs"]:
-            print(f"Save best weight at acc {round(metric_monitor.curr_acc,4)}, epoch: {epoch}")
-            if not os.path.exists(params["model"]):
-                os.makedirs(params["model"])
-            torch.save({'model': model.state_dict(), 
-                'loss': loss,
-                'preds': round(metric_monitor.curr_acc,4)},
-                 f'weights/{params["model"]}/{params["model"]}_fold{fold}_best_epoch_{epoch}.pth')
-
-            best_acc = metric_monitor.curr_acc
+                "TTA Validation. {metric_monitor}".format(metric_monitor=metric_monitor)
+            )
+        best_acc = metric_monitor.curr_acc
+        
+    # print(f"Total output change: {count_change}")
     return best_acc
 
 if __name__ == "__main__":
@@ -308,62 +287,54 @@ if __name__ == "__main__":
     label_map = pd.read_json(f'{root}/label_num_to_disease_map.json', 
                             orient='index')
 
-    models_name = ["resnest26d","resnest50d","tf_efficientnet_b3_ns", "skresnet34" ,"cspresnet50", "vit_base_patch16_384"]
+    models_name = ["resnest26d","resnest50d","tf_efficientnet_b3_ns"]
     WEIGHTS = [
-        "weights/resnest26d/resnest26d_fold0_best_epoch_28_final_1st.pth",
-        "weights/resnest26d/resnest26d_fold0_best_epoch_13_final_mixup.pth",
-        "weights/resnest26d/resnest26d_fold2_best_epoch_3_final_hnm.pth",
-        "weights/resnest26d/resnest26d_fold4_best_epoch_29_1st.pth",
-        "weights/resnest26d/resnest26d_fold4_best_epoch_26_mix.pth",
-        "weights/resnest26d/resnest26d_fold4_best_epoch_12_cutmix.pth",
-        "weights/resnest26d/resnest26d_fold4_best_epoch_3_external.pth",
-        "weights/resnest26d/resnest26d_fold4_best_epoch_21_final_512.pth",
-        "weights/tf_efficientnet_b3_ns/tf_efficientnet_b3_ns_fold1_best_epoch_19_external.pth",
-        "weights/tf_efficientnet_b3_ns/tf_efficientnet_b3_ns_fold1_best_epoch_26_512.pth",
-        "weights/tf_efficientnet_b3_ns/tf_efficientnet_b3_ns_fold1_best_epoch_1_final_512.pth",
-        "weights/resnest50d/resnest50d_fold1_best_epoch_95_final_1st.pth",
-    #     "weights/resnest50d/resnest50d_fold1_best_epoch_9_final_512.pth"
-        "weights/resnest50d/resnest50d_fold1_best_epoch_38_clean_1st.pth"
-            
+        # "./weights/resnest50d/resnest50d_fold0_best_epoch_30_final_2nd.pth",
+        # "./weights/resnest50d/resnest50d_fold1_best_epoch_95_final_1st.pth",
+        # "./weights/resnest50d/resnest50d_fold2_best_epoch_50_final_1st.pth",
+        # "./weights/resnest50d/resnest50d_fold3_best_epoch_2_final_2nd.pth",
+        # "./weights/resnest50d/resnest50d_fold4_best_epoch_10_final_2nd.pth",
+        "./weights/resnest26d/resnest26d_fold0_best_epoch_4_final_512.pth",
+        "./weights/resnest26d/resnest26d_fold1_best_epoch_7_finale_ex_hnm.pth",
+        "./weights/resnest26d/resnest26d_fold2_best_epoch_4_final_512.pth",
+        "./weights/resnest26d/resnest26d_fold4_best_epoch_21_final_512.pth",
     ]
     model_index = 0
     ckpt_index = 1
-    fold_ckpt_index = [11,12]
-    fold_ckpt_weight = [1,1]
 
     params = {
         "visualize": False,
-        "fold": [0,1,2,3,4],
-        "train_external": False,
-        "train_clean_only": False,
+        "fold": [0,1,2,4],
+        "train_external": True,
         "test_external": False,
-        "load_pretrained": False,
+        "load_pretrained": True,
         "resume": False,
-        "image_size": 320,
+        "image_size": 512,
         "num_classes": 5,
         "model": models_name[model_index],
         "device": "cuda",
-        "lr": 1e-3,
-        "lr_min":1e-7,
-        "batch_size": 2,
-        "num_workers": 1,
-        "epochs": 10,
-        "gradient_accumulation_steps": 1,
-        "drop_block": 0.1,
-        "drop_rate": 0.3,
-        "mix_up": False,
-        "cutmix":False,
-        "smooth_label": 0,
+        "lr": 5e-5,
+        "lr_min":1e-6,
+        "batch_size": 16,
+        "num_workers": 8,
+        "epochs": 100,
+        "gradient_accumulation_steps": 8,
+        "drop_block": 0.2,
+        "drop_rate": 0.2,
+        "mix_up": True,
+        "cutmix":True,
         "rand_aug": False,
         "local_rank":0,
         "distributed": False,
         "hard_negative_sample": False,
         "tta": True,
-        "train_phase":True,
+        "crops_tta":False,
+        "train_phase":False,
         "balance_data":False,
-        "kfold_pred":False
+        "kfold_pred":True,
+        "ensemble": True,
+        "error_analysis":False,
     }
-
     if "efficientnet" in params["model"]:
         model = timm.create_model(
                 params["model"],
@@ -392,60 +363,91 @@ if __name__ == "__main__":
     criterion = LabelSmoothingCrossEntropy().to(params["device"])
     if params["mix_up"]:
         criterion = SoftTargetCrossEntropy().to(params["device"])
-    asymetric_criterion = AsymmetricLossSingleLabel().to(params["device"])
-    symetric_criterion = SCELoss(smooth_label=params["smooth_label"]).to(params["device"])
 
     if params["distributed"]:
         assert ValueError("No need to implement in a single machine")
     else:
         model = torch.nn.DataParallel(model)    
-    optimizer = torch.optim.Adam(model.parameters(), lr=params["lr"])
-    # scheduler = CosineAnnealingLR(optimizer, T_max=10, eta_min=params["lr_min"], last_epoch=-1)
-    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=1, eta_min=params["lr_min"], last_epoch=-1)
-            
-    train_transform = A.Compose(
-        [
-            A.RandomResizedCrop(height=params["image_size"], width=params["image_size"], p=1),
-            A.OneOf([
-                A.RandomRotate90(p=0.5),
-                A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.05, rotate_limit=15, p=0.5),], p=1.
-            ),
-    #         A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.05, rotate_limit=15, p=0.5),
-            A.HorizontalFlip(p=0.5),
-            A.VerticalFlip(p=0.5),
-            A.IAAAffine(rotate=0.2, shear=0.2,p=0.5),
-            A.CoarseDropout(max_holes=20, max_height=int(params["image_size"]/15), max_width=int(params["image_size"]/15), p=0.5),
-    #         A.IAAAdditiveGaussianNoise(p=1.),
-            A.MedianBlur(p=0.5),
-            A.Equalize(p=0.2),
-            A.GridDistortion(p=0.2),
-    #         A.RandomGridShuffle(grid=(100, 100), p=0.5),
-            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-            ToTensorV2(),
-        ]
-    )
+        
     val_transform = A.Compose(
         [
-            A.CenterCrop(height=params["image_size"], width=params["image_size"], p=1),
+            # A.CenterCrop(height=params["image_size"], width=params["image_size"], p=1),
             A.Resize(params["image_size"],params["image_size"]),
             A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
             ToTensorV2(),
         ]
     )
-    if params["cutmix"]:
-        mixup_fn = Mixup(mixup_alpha=1., cutmix_alpha=1., label_smoothing=params["smooth_label"], num_classes=params["num_classes"])
-    else:
-        mixup_fn = Mixup(mixup_alpha=1., label_smoothing=params["smooth_label"], num_classes=params["num_classes"])
+    transform_tta0 = A.Compose(
+        [
+            # A.CenterCrop(height=params["image_size"], width=params["image_size"], p=1),    
+            A.Resize(height=params["image_size"], width=params["image_size"], p=1),
+            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),   
+            ToTensorV2()
+        ]
+        )
 
+    transform_tta1 = A.Compose(
+        [
+            # A.CenterCrop(height=params["image_size"], width=params["image_size"], p=1),
+            A.Resize(height=params["image_size"], width=params["image_size"], p=1),
+            A.HorizontalFlip(p=1.),
+            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),   
+            ToTensorV2()
+        ]
+    )
+    transform_tta2 = A.Compose(
+        [
+            # A.CenterCrop(height=params["image_size"], width=params["image_size"], p=1),
+            A.Resize(height=params["image_size"], width=params["image_size"], p=1),
+            A.VerticalFlip(p=1.),
+            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            ToTensorV2(),
+        ]
+    )
+    transform_tta3 = A.Compose(
+        [
+            # A.CenterCrop(height=params["image_size"], width=params["image_size"], p=1),
+            A.Resize(height=params["image_size"], width=params["image_size"], p=1),
+            A.RandomRotate90(p=1.),
+            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),     
+            ToTensorV2(),
+        ]
+    )
 
+    ##### Test TTA with Five Crops
+    transform_crop_tta0 = T.Compose([
+                    T.FiveCrop(params["image_size"]),
+                    T.Lambda(lambda crops: ([T.ToTensor()(crop) for crop in crops])),
+                    T.Lambda(lambda norms: torch.stack([T.Normalize(mean=[0.5], std=[0.5])(norm) for norm in norms]))
+            ]
+    )
+        
+    transform_crop_tta1 = T.Compose([
+                    T.FiveCrop(params["image_size"]),
+                    T.Lambda(lambda crops: ([T.ToTensor()(crop) for crop in crops])),
+                    T.Lambda(lambda flips: ([T.RandomHorizontalFlip(p=1.)(flip) for flip in flips])),
+                    T.Lambda(lambda norms: torch.stack([T.Normalize(mean=[0.5], std=[0.5])(norm) for norm in norms]))
+        ]
+    )
+    transform_crop_tta2 = T.Compose([
+                    T.FiveCrop(params["image_size"]),
+                    T.Lambda(lambda crops: ([T.ToTensor()(crop) for crop in crops])),
+                    T.Lambda(lambda flips: ([T.RandomVerticalFlip(p=1.)(flip) for flip in flips])),
+                    T.Lambda(lambda norms: torch.stack([T.Normalize(mean=[0.5], std=[0.5])(norm) for norm in norms]))
+        ]
+    )
+    test_transform_tta = [transform_tta0, transform_tta1, transform_tta2, transform_tta3]
+    test_transform_tta_crops = [transform_crop_tta0, transform_crop_tta1, transform_crop_tta2]
+  
     folds = train.copy()
     Fold = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
     for n, (train_index, val_index) in enumerate(Fold.split(folds, folds['label'])):
         folds.loc[val_index, 'fold'] = int(n)
     folds['fold'] = folds['fold'].astype(int)
-    for i in params["fold"]:
-        print(f"Train Fold: {i}")
-        fold = params["fold"][i]
+    cv_acc = 0.
+    for i, fold_idx in enumerate(params["fold"]):
+        print(f"Validate Fold: {fold_idx}")
+        fold = fold_idx
         train_idx = folds[folds['fold'] != fold].index
         val_idx = folds[folds['fold'] == fold].index
 
@@ -457,8 +459,6 @@ if __name__ == "__main__":
         train_external['fold'] = train_external['fold'].astype(int)
         if params["train_external"]:
             train_folds = merge_data(train_folds, train_external)
-        if params["train_clean_only"]:
-            train_folds = train_external
         #     train_folds = pd.read_csv(f'{root}/train_{params["fold"]}_pseudo.csv')
         #     val_folds = pd.read_csv(f'{root}/val_{params["fold"]}_pseudo.csv')    
 
@@ -469,40 +469,34 @@ if __name__ == "__main__":
             train_folds = balance_data(train_folds, mode="undersampling")    
             val_folds = balance_data(val_folds, mode="undersampling", val=True)
 
-        train_dataset = TrainDataset(train_folds, transform=train_transform)
-        val_dataset = TrainDataset(val_folds, transform=val_transform)
-
-
-        if params["hard_negative_sample"]:
-            train_loader = DataLoader(
-                train_dataset, batch_size=1, shuffle=True, num_workers=params["num_workers"], pin_memory=True,
-            )
+        train_dataset = TestDataset(train_folds, transform=test_transform_tta, valid_test=True)
+        train_loader = DataLoader(
+            train_dataset, batch_size=params["batch_size"], shuffle=True, num_workers=params["num_workers"], pin_memory=True,
+        )
+        if params["tta"]:
+            val_pred_dataset = TestDataset(val_folds, transform=test_transform_tta, valid_test=True)
+            test_pred_dataset = TestDataset(test, transform=test_transform_tta)
         else:
-            train_loader = DataLoader(
-                train_dataset, batch_size=params["batch_size"], shuffle=True, num_workers=params["num_workers"], pin_memory=True,
-            )
-        val_loader = DataLoader(
-            val_dataset, batch_size=params["batch_size"], shuffle=False, num_workers=params["num_workers"], pin_memory=True,
+            val_pred_dataset = TestDataset(val_folds, transform=val_transform, valid_test=True)
+            test_pred_dataset = TestDataset(test, transform=val_transform)
+
+        val_pred_dataset_crops = TestDataset(val_folds, transform=test_transform_tta_crops,valid_test=True, fcrops=True)
+
+        val_pred_loader = DataLoader(
+            val_pred_dataset, batch_size=params['batch_size'], shuffle=False, num_workers=2, pin_memory=True,
+        )
+        val_pred_loader_crop = DataLoader(
+            val_pred_dataset_crops, batch_size=params['batch_size'], shuffle=False, num_workers=2, pin_memory=True,
+        )
+        test_pred_loader = DataLoader(
+            test_pred_dataset, batch_size=params['batch_size'], shuffle=False, num_workers=2, pin_memory=True,
         )
 
-        if params["load_pretrained"]:
-            state_dict = torch.load(WEIGHTS[ckpt_index])
-            print("Load pretrained model: ",state_dict["preds"])
-            model.load_state_dict(state_dict["model"])
-            best_acc = state_dict["preds"]
-            # Hard negative mining based on train data and pretrained model on that data
-            if params["hard_negative_sample"]:
-                update_train_data = update_hard_sample(train_loader, model, val_criterion, thres=0.2)
-                update_train_folds = pd.DataFrame(data=update_train_data)
-                update_train_folds = pd.concat(5*[update_train_folds])
-                #update the training set
-                update_train_dataset = TrainDataset(update_train_folds, transform=train_transform)
-                update_train_loader = DataLoader(
-                    update_train_dataset, batch_size=params["batch_size"], shuffle=True, num_workers=params["num_workers"], pin_memory=True,
-                )                
-        else:
-            best_acc = 0.
-            
-        for epoch in range(1, params["epochs"] + 1):
-            train_epoch(train_loader, model, criterion, optimizer, epoch, params)
-            best_acc = validate(val_loader, model, criterion, epoch, params, fold, best_acc)
+        state_dict = torch.load(WEIGHTS[i])
+        fold_acc = state_dict["preds"]
+        print(f"Load pretrained model: {WEIGHTS[i]} with acc: {fold_acc}")
+        model.load_state_dict(state_dict["model"])
+
+        cv_acc += tta_validate(val_pred_loader, model, params)
+                
+    print(f"Done CV validation with accuracy: {round(cv_acc/5,4)}")
