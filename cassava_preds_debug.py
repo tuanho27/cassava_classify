@@ -41,7 +41,7 @@ def seed_everything(SEED):
     torch.backends.cudnn.benchmark = True
 seed_everything(SEED)
 
-os.environ['CUDA_VISIBLE_DEVICES'] ="0,1"
+os.environ['CUDA_VISIBLE_DEVICES'] ="1"
 
 
 def merge_data(df1, df2):
@@ -289,24 +289,27 @@ if __name__ == "__main__":
 
     models_name = ["resnest26d","resnest50d","tf_efficientnet_b3_ns"]
     WEIGHTS = [
-        # "./weights/resnest50d/resnest50d_fold0_best_epoch_30_final_2nd.pth",
+        "./weights/resnest50d/resnest50d_fold0_best_epoch_30_final_2nd.pth",
         # "./weights/resnest50d/resnest50d_fold1_best_epoch_95_final_1st.pth",
+        "./weights/resnest50d/resnest50d_fold1_best_epoch_17_final_2nd.pth",
         # "./weights/resnest50d/resnest50d_fold2_best_epoch_50_final_1st.pth",
-        # "./weights/resnest50d/resnest50d_fold3_best_epoch_2_final_2nd.pth",
+        "./weights/resnest50d/resnest50d_fold2_best_epoch_22_final_2nd.pth",
+        "./weights/resnest50d/resnest50d_fold3_best_epoch_2_final_2nd.pth",
         # "./weights/resnest50d/resnest50d_fold4_best_epoch_10_final_2nd.pth",
+        "./weights/resnest50d/resnest50d_fold4_best_epoch_15_final_3rd.pth"
         
-        "./weights/resnest26d/resnest26d_fold0_best_epoch_4_final_2nd.pth",
-        "./weights/resnest26d/resnest26d_fold1_best_epoch_7_final_2nd.pth",
-        "./weights/resnest26d/resnest26d_fold2_best_epoch_4_final_2nd.pth",
-        # "./weights/resnest26d/resnest26d_fold3_best_epoch_58.pth",
-        "./weights/resnest26d/resnest26d_fold4_best_epoch_21_final_2nd.pth",
+        # "./weights/resnest26d/resnest26d_fold0_best_epoch_4_final_2nd.pth",
+        # "./weights/resnest26d/resnest26d_fold1_best_epoch_7_final_2nd.pth",
+        # "./weights/resnest26d/resnest26d_fold2_best_epoch_4_final_2nd.pth",
+        # "./weights/resnest26d/resnest26d_fold3_best_epoch_15_final_2nd.pth",
+        # "./weights/resnest26d/resnest26d_fold4_best_epoch_21_final_2nd.pth",
     ]
-    model_index = 0
+    model_index = 1
     ckpt_index = 1
 
     params = {
         "visualize": False,
-        "fold": [0,1,2,4],
+        "fold": [0,1,2,3,4],
         "train_external": True,
         "test_external": False,
         "load_pretrained": True,

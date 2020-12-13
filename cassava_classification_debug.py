@@ -18,6 +18,7 @@ import torch.optim
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
 import torchvision.models as models
+from  torch.cuda.amp import autocast, GradScaler
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import accuracy_score
 from sklearn.utils import resample
@@ -39,7 +40,7 @@ def seed_everything(SEED):
     torch.backends.cudnn.benchmark = True
 seed_everything(SEED)
 
-os.environ['CUDA_VISIBLE_DEVICES'] ="0"
+os.environ['CUDA_VISIBLE_DEVICES'] ="1"
 
 
 def merge_data(df1, df2):
@@ -242,41 +243,41 @@ def train_epoch(train_loader, model, criterion, optimizer, epoch, params, criter
         stream = tqdm(train_loader)
     for i, (images, target, _) in enumerate(stream, start=1):
         mix_decision = np.random.rand()
-
-        images = images.to(params["device"]) #, non_blocking=True)
-        target = target.to(params["device"]) #, non_blocking=True) #.view(-1,params['batch_size'])
-        if mix_decision < 0.25:
-            if params["mix_up"]:
-                images , mtarget = mixup_fn(images, target)
-        elif mix_decision >=0.25 and mix_decision < 0.5:
+        with autocast():
+            images = images.to(params["device"]) #, non_blocking=True)
+            target = target.to(params["device"]) #, non_blocking=True) #.view(-1,params['batch_size'])
+            # if mix_decision < 0.25:
+            #     if params["mix_up"]:
+            #         images , mtarget = mixup_fn(images, target)
+            # elif mix_decision >=0.25 and mix_decision < 0.5:
             if params["fmix"]:
                 images , ftarget = fmix(images, target, alpha=1., decay_power=5.,
                                     shape=(params["image_size"],params["image_size"]),
                                     device=params["device"])
-        output = model(images)
-        if isinstance(output, (tuple, list)):
-            output = output[0]
-            
-        if mix_decision < 0.25:
-            loss = criterion(output, mtarget)
-        else:
+            output = model(images)
+            if isinstance(output, (tuple, list)):
+                output = output[0]
+                
+            # if mix_decision < 0.25:
+            #     loss = criterion(output, mtarget)
+            # else:
             loss = criterion_fmix(output, ftarget[0]) * ftarget[2] + criterion_fmix(output, ftarget[1]) * (1. - ftarget[2])
+                
+            # loss1 = symetric_criterion(output, target)
+            # loss2 = asymetric_criterion(output, target)
             
-        # loss1 = symetric_criterion(output, target)
-        # loss2 = asymetric_criterion(output, target)
+            if params['gradient_accumulation_steps'] > 1:
+                loss = loss / params['gradient_accumulation_steps']
         
-        if params['gradient_accumulation_steps'] > 1:
-            loss = loss / params['gradient_accumulation_steps']
-    
-        accuracy = calculate_accuracy(output, target)
-        metric_monitor.update("Loss", loss.item())
-        metric_monitor.update("Accuracy", accuracy)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        stream.set_description(
-            "Epoch: {epoch}. Train.      {metric_monitor}".format(epoch=epoch, metric_monitor=metric_monitor)
-        )
+            accuracy = calculate_accuracy(output, target)
+            metric_monitor.update("Loss", loss.item())
+            metric_monitor.update("Accuracy", accuracy)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            stream.set_description(
+                "Epoch: {epoch}. Train.      {metric_monitor}".format(epoch=epoch, metric_monitor=metric_monitor)
+            )
 
 
 def validate(val_loader, model, criterion, epoch, params, fold, best_acc):
@@ -330,8 +331,8 @@ if __name__ == "__main__":
         # "./weights/resnest50d/resnest50d_fold3_best_epoch_2_final_2nd.pth",
         # "./weights/resnest50d/resnest50d_fold4_best_epoch_10_final_2nd.pth",
         
-        "./weights/resnest26d/resnest26d_fold0_best_epoch_4_final_2nd.pth",
-        "./weights/resnest26d/resnest26d_fold1_best_epoch_7_final_2nd.pth",
+        # "./weights/resnest26d/resnest26d_fold0_best_epoch_4_final_2nd.pth",
+        # "./weights/resnest26d/resnest26d_fold1_best_epoch_7_final_2nd.pth",
         "./weights/resnest26d/resnest26d_fold2_best_epoch_4_final_2nd.pth",
         "./weights/resnest26d/resnest26d_fold3_best_epoch_15_final_2nd.pth",
         "./weights/resnest26d/resnest26d_fold4_best_epoch_21_final_2nd.pth",
@@ -346,7 +347,7 @@ if __name__ == "__main__":
 
     params = {
         "visualize": False,
-        "fold": [0,1,2,3,4],
+        "fold": [2,3,4],
         "train_external": True,
         "train_clean_only": False,
         "test_external": False,
@@ -356,9 +357,9 @@ if __name__ == "__main__":
         "num_classes": 5,
         "model": models_name[model_index],
         "device": "cuda",
-        "lr": 1e-4,
+        "lr": 2e-4,
         "lr_min":1e-7,
-        "batch_size": 8,
+        "batch_size": 16,
         "num_workers": 4,
         "epochs": 20,
         "gradient_accumulation_steps": 1,
