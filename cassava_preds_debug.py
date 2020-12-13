@@ -41,7 +41,7 @@ def seed_everything(SEED):
     torch.backends.cudnn.benchmark = True
 seed_everything(SEED)
 
-os.environ['CUDA_VISIBLE_DEVICES'] ="1"
+os.environ['CUDA_VISIBLE_DEVICES'] ="0"
 
 
 def merge_data(df1, df2):
@@ -213,8 +213,11 @@ def gmean(input_x, dim):
     log_x = torch.log(input_x)
     return torch.exp(torch.mean(log_x, dim=dim))
 
-def tta_validate(loader, model, params):
+def tta_validate(loader, model, params, fold_idx):
     num_tta = len(test_transform_tta)
+    pred_list = {'image_id':[],
+                 'prob':[],}
+
     incorrect_pred_list = {'image_id':[],
                        'label':[],
                        'pred':[],
@@ -241,6 +244,10 @@ def tta_validate(loader, model, params):
 
             topk_output, topk_ids = torch.topk(output, params["num_classes"])
             for i in range(len(data["labels"][0])):
+                if params["distill_soft_label"]:
+                    pred_list['image_id'].append(data["image_ids"][0][i])
+                    pred_list['prob'].append(output[i].cpu().numpy())
+                    
                 if params["error_analysis"]:
                     ## adjust the output prediction
                     max_1st = topk_ids[i][0]
@@ -271,6 +278,8 @@ def tta_validate(loader, model, params):
             stream.set_description(
                 "TTA Validation. {metric_monitor}".format(metric_monitor=metric_monitor)
             )
+        pred_val = pd.DataFrame(pred_list)
+        pred_val.to_csv(f'./error_analysis/val_{params["model"]}_{fold_idx}_pred.csv' ,index=False)
         best_acc = metric_monitor.curr_acc
         
     # print(f"Total output change: {count_change}")
@@ -289,7 +298,8 @@ if __name__ == "__main__":
 
     models_name = ["resnest26d","resnest50d","tf_efficientnet_b3_ns"]
     WEIGHTS = [
-        "./weights/resnest50d/resnest50d_fold0_best_epoch_30_final_2nd.pth",
+        #"./weights/resnest50d/resnest50d_fold0_best_epoch_30_final_1st.pth",
+        "./weights/resnest50d/resnest50d_fold0_best_epoch_13_final_2nd.pth",
         # "./weights/resnest50d/resnest50d_fold1_best_epoch_95_final_1st.pth",
         "./weights/resnest50d/resnest50d_fold1_best_epoch_17_final_2nd.pth",
         # "./weights/resnest50d/resnest50d_fold2_best_epoch_50_final_1st.pth",
@@ -299,10 +309,13 @@ if __name__ == "__main__":
         "./weights/resnest50d/resnest50d_fold4_best_epoch_15_final_3rd.pth"
         
         # "./weights/resnest26d/resnest26d_fold0_best_epoch_4_final_2nd.pth",
+        # # "./weights/resnest26d/resnest26d_fold0_best_epoch_19_final_3rd.pth",
         # "./weights/resnest26d/resnest26d_fold1_best_epoch_7_final_2nd.pth",
         # "./weights/resnest26d/resnest26d_fold2_best_epoch_4_final_2nd.pth",
         # "./weights/resnest26d/resnest26d_fold3_best_epoch_15_final_2nd.pth",
+        # # "./weights/resnest26d/resnest26d_fold3_best_epoch_10_final_3rd.pth",
         # "./weights/resnest26d/resnest26d_fold4_best_epoch_21_final_2nd.pth",
+        # # "./weights/resnest26d/resnest26d_fold4_best_epoch_6_final_3rd.pth",
     ]
     model_index = 1
     ckpt_index = 1
@@ -310,6 +323,7 @@ if __name__ == "__main__":
     params = {
         "visualize": False,
         "fold": [0,1,2,3,4],
+        "distill_soft_label":True,
         "train_external": True,
         "test_external": False,
         "load_pretrained": True,
@@ -502,6 +516,6 @@ if __name__ == "__main__":
         print(f"Load pretrained model: {WEIGHTS[i]} with acc: {fold_acc}")
         model.load_state_dict(state_dict["model"])
 
-        cv_acc += tta_validate(val_pred_loader, model, params)
+        cv_acc += tta_validate(val_pred_loader, model, params, fold_idx)
     num_fold_train = len(params["fold"])            
     print(f"Done CV validation with  {num_fold_train} folds, Accuracy: {round(cv_acc/num_fold_train,4)}")

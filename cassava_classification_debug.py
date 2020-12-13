@@ -94,13 +94,15 @@ def balance_data(df, mode="undersampling", val=False):
 
 # Dataset
 class TrainDataset(Dataset):
-    def __init__(self, df, transform=None, mosaic_mix = False):
+    def __init__(self, df,transform=None, mosaic_mix = False, soft_df = None):
         self.df = df
         self.file_names = df['image_id'].values
         self.labels = df['label'].values
         self.transform = transform
         self.mosaic_mix = mosaic_mix
         self.rand_aug_fn = RandAugment()
+        if soft_df is not None:
+            self.distill_soft_target = soft_df 
         
     def __len__(self):
         return len(self.df)
@@ -116,10 +118,17 @@ class TrainDataset(Dataset):
         if self.transform:
             augmented = self.transform(image=image)
             image = augmented['image']
-
-        return image, label, file_name
+        if self.distill_soft_target is not None:
+            try:
+                soft_label = [float(t) for t in soft_target_distill[idx][0].split(" ")]
+                soft_label = torch.tensor(soft_label)
+            except:
+                soft_label = torch.tensor([0., 0., 0., 0., 0.])
+        else:
+            soft_label = 0.
+        return image, label, soft_label, file_name
+            
     
-
 class TestDataset(Dataset):
     def __init__(self, df, transform=None, valid_test=False, fcrops=False):
         self.df = df
@@ -176,7 +185,7 @@ class TestDataset(Dataset):
         return image
 
 def calculate_accuracy(output, target):
-#     return torch.true_divide((target == output).sum(dim=0), output.size(0)).item()
+    # return torch.true_divide((target == output).sum(dim=0), output.size(0)).item()
     if params["mix_up"]:
         output = torch.argmax(torch.softmax(output, dim=1), dim=1)
         return accuracy_score(output.cpu(), target.cpu())
@@ -234,35 +243,39 @@ def update_hard_sample(train_loader, model, val_criterion, thres):
                 label=train_loss_list['label'],
                 fold=train_loss_list['fold'])
 
-def train_epoch(train_loader, model, criterion, optimizer, epoch, params, criterion_fmix=None):
+def train_epoch(train_loader, model, criterion, optimizer, epoch, params, scaler=None, criterion_fmix=None):
     metric_monitor = MetricMonitor()
     model.train()
     if params["hard_negative_sample"]:
         stream = tqdm(update_train_loader)
     else:
         stream = tqdm(train_loader)
-    for i, (images, target, _) in enumerate(stream, start=1):
+    for i, (images, target, soft_target, _) in enumerate(stream, start=1):
         mix_decision = np.random.rand()
-        with autocast():
-            images = images.to(params["device"]) #, non_blocking=True)
-            target = target.to(params["device"]) #, non_blocking=True) #.view(-1,params['batch_size'])
-            # if mix_decision < 0.25:
-            #     if params["mix_up"]:
-            #         images , mtarget = mixup_fn(images, target)
-            # elif mix_decision >=0.25 and mix_decision < 0.5:
-            if params["fmix"]:
-                images , ftarget = fmix(images, target, alpha=1., decay_power=5.,
-                                    shape=(params["image_size"],params["image_size"]),
-                                    device=params["device"])
+        images = images.to(params["device"]) #, non_blocking=True)
+        target = target.to(params["device"]) #, non_blocking=True) #.view(-1,params['batch_size'])
+        # if mix_decision < 0.25:
+        if params["mix_up"]:
+            images , mtarget = mixup_fn(images, target)
+            if params["distill_soft_label"]:
+                
+                mtarget = mtarget*0.7 + soft_target.to(params['device']) * 0.3
+        # elif mix_decision >=0.25 and mix_decision < 0.5:
+        #     if params["fmix"]:
+        #         images , ftarget = fmix(images, target, alpha=1., decay_power=5.,
+        #                             shape=(params["image_size"],params["image_size"]),
+        #                             device=params["device"])
             output = model(images)
             if isinstance(output, (tuple, list)):
                 output = output[0]
+
+            loss = criterion(output, mtarget)
                 
             # if mix_decision < 0.25:
             #     loss = criterion(output, mtarget)
             # else:
-            loss = criterion_fmix(output, ftarget[0]) * ftarget[2] + criterion_fmix(output, ftarget[1]) * (1. - ftarget[2])
-                
+            #     loss = criterion_fmix(output, ftarget[0]) * ftarget[2] + criterion_fmix(output, ftarget[1]) * (1. - ftarget[2])
+            
             # loss1 = symetric_criterion(output, target)
             # loss2 = asymetric_criterion(output, target)
             
@@ -275,10 +288,12 @@ def train_epoch(train_loader, model, criterion, optimizer, epoch, params, criter
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            # scaler.scale(loss).backward()
+            # scaler.step(optimizer)
+            # scaler.update()
             stream.set_description(
                 "Epoch: {epoch}. Train.      {metric_monitor}".format(epoch=epoch, metric_monitor=metric_monitor)
             )
-
 
 def validate(val_loader, model, criterion, epoch, params, fold, best_acc):
     metric_monitor = MetricMonitor()
@@ -323,32 +338,38 @@ if __name__ == "__main__":
     label_map = pd.read_json(f'{root}/label_num_to_disease_map.json', 
                             orient='index')
 
+
     models_name = ["resnest26d","resnest50d","tf_efficientnet_b3_ns" , "vit_base_patch16_384"]
     WEIGHTS = [
-        # "./weights/resnest50d/resnest50d_fold0_best_epoch_30_final_2nd.pth",
-        # "./weights/resnest50d/resnest50d_fold1_best_epoch_17_final_2nd.pth",
-        # "./weights/resnest50d/resnest50d_fold2_best_epoch_22_final_2nd.pth",
-        # "./weights/resnest50d/resnest50d_fold3_best_epoch_2_final_2nd.pth",
+        #"./weights/resnest50d/resnest50d_fold0_best_epoch_30_final_1st.pth",
+        "./weights/resnest50d/resnest50d_fold0_best_epoch_13_final_2nd.pth",
+        # "./weights/resnest50d/resnest50d_fold1_best_epoch_95_final_1st.pth",
+        "./weights/resnest50d/resnest50d_fold1_best_epoch_17_final_2nd.pth",
+        # "./weights/resnest50d/resnest50d_fold2_best_epoch_50_final_1st.pth",
+        "./weights/resnest50d/resnest50d_fold2_best_epoch_22_final_2nd.pth",
+        "./weights/resnest50d/resnest50d_fold3_best_epoch_2_final_2nd.pth",
         # "./weights/resnest50d/resnest50d_fold4_best_epoch_10_final_2nd.pth",
+        "./weights/resnest50d/resnest50d_fold4_best_epoch_15_final_3rd.pth"
         
         # "./weights/resnest26d/resnest26d_fold0_best_epoch_4_final_2nd.pth",
         # "./weights/resnest26d/resnest26d_fold1_best_epoch_7_final_2nd.pth",
-        "./weights/resnest26d/resnest26d_fold2_best_epoch_4_final_2nd.pth",
-        "./weights/resnest26d/resnest26d_fold3_best_epoch_15_final_2nd.pth",
-        "./weights/resnest26d/resnest26d_fold4_best_epoch_21_final_2nd.pth",
+        # "./weights/resnest26d/resnest26d_fold2_best_epoch_4_final_2nd.pth",
+        # "./weights/resnest26d/resnest26d_fold3_best_epoch_15_final_2nd.pth",
+        # "./weights/resnest26d/resnest26d_fold4_best_epoch_21_final_2nd.pth",
 
         # "weights/resnest50d/resnest50d_fold1_best_epoch_38_clean_1st.pth"
             
     ]
-    model_index = 0
+    model_index = 1
     ckpt_index = 5
     fold_ckpt_index = [11,12]
     fold_ckpt_weight = [1,1]
 
     params = {
         "visualize": False,
-        "fold": [2,3,4],
-        "train_external": True,
+        "fold": [0,1,2,3,4],
+        "distill_soft_label": True,
+        "train_external": False,
         "train_clean_only": False,
         "test_external": False,
         "load_pretrained": True,
@@ -357,9 +378,9 @@ if __name__ == "__main__":
         "num_classes": 5,
         "model": models_name[model_index],
         "device": "cuda",
-        "lr": 2e-4,
+        "lr": 1e-4,
         "lr_min":1e-7,
-        "batch_size": 16,
+        "batch_size": 8,
         "num_workers": 4,
         "epochs": 20,
         "gradient_accumulation_steps": 1,
@@ -378,6 +399,7 @@ if __name__ == "__main__":
         "balance_data":False,
         "kfold_pred":False
     }
+
 
     if "efficientnet" in params["model"]:
         model = timm.create_model(
@@ -400,7 +422,7 @@ if __name__ == "__main__":
                 pretrained=True,
                 num_classes=params["num_classes"],
                 drop_block_rate=params["drop_block"])
-
+    scaler = GradScaler()   
     model = model.to(params["device"])
     val_criterion = nn.CrossEntropyLoss().to(params["device"])
     criterion_fmix = nn.CrossEntropyLoss().to(params["device"])
@@ -459,6 +481,7 @@ if __name__ == "__main__":
         folds.loc[val_index, 'fold'] = int(n)
     folds['fold'] = folds['fold'].astype(int)
     for i, fold_idx in enumerate(params["fold"]):
+
         print(f"Train Fold: {fold_idx}")
         fold = fold_idx
         train_idx = folds[folds['fold'] != fold].index
@@ -466,27 +489,46 @@ if __name__ == "__main__":
 
         train_folds = folds.loc[train_idx].reset_index(drop=True)
         val_folds = folds.loc[val_idx].reset_index(drop=True)
-
+        
         for idx,label in enumerate(train_external['label']):
             train_external.loc[idx,'fold'] = fold
         train_external['fold'] = train_external['fold'].astype(int)
+        
         if params["train_external"]:
             train_folds = merge_data(train_folds, train_external)
+            params["distill_soft_label"] = False
         if params["train_clean_only"]:
             train_folds = train_external
+            params["distill_soft_label"] = False
+            
         #     train_folds = pd.read_csv(f'{root}/train_{params["fold"]}_pseudo.csv')
         #     val_folds = pd.read_csv(f'{root}/val_{params["fold"]}_pseudo.csv')    
 
         if params["test_external"]:
             train_folds = merge_data(train_folds, test_external_pseudo)
+            params["distill_soft_label"] = False
             
         if params["balance_data"]:
             train_folds = balance_data(train_folds, mode="undersampling")    
             val_folds = balance_data(val_folds, mode="undersampling", val=True)
-
-        train_dataset = TrainDataset(train_folds, transform=train_transform)
+            params["distill_soft_label"] = False
+        
+        # for distillation using soft label    
+        if params["distill_soft_label"]:
+            soft_target_list = set(params["fold"]) - set([fold_idx])
+            for k, f in enumerate(soft_target_list):
+                if k == 0:
+                    soft_target_distill = pd.read_csv(f'./error_analysis/val_{params["model"]}_{f}_pred.csv')
+                else:
+                    soft_target_distill = merge_data(soft_target_distill,  pd.read_csv(f'./error_analysis/val_{params["model"]}_{f}_pred.csv'))
+            # import ipdb; ipdb.set_trace()
+            soft_target_distill = soft_target_distill.reset_index(drop=True)
+            soft_target_distill = soft_target_distill.set_index('image_id').sort_index().values
+            # train_folds = train_folds.set_index('image_id').sort_index()
+            train_dataset = TrainDataset(train_folds, transform=train_transform, soft_df=soft_target_distill)
+        else:
+            train_dataset = TrainDataset(train_folds, transform=train_transform)            
         val_dataset = TrainDataset(val_folds, transform=val_transform)
-
 
         if params["hard_negative_sample"]:
             train_loader = DataLoader(
@@ -519,5 +561,5 @@ if __name__ == "__main__":
             best_acc = 0.
             
         for epoch in range(1, params["epochs"] + 1):
-            train_epoch(train_loader, model, criterion, optimizer, epoch, params, criterion_fmix=criterion_fmix)
+            train_epoch(train_loader, model, criterion, optimizer, epoch, params, scaler,criterion_fmix=criterion_fmix)
             best_acc = validate(val_loader, model, criterion, epoch, params, fold, best_acc)
