@@ -41,7 +41,7 @@ def seed_everything(SEED):
     torch.backends.cudnn.benchmark = True
 seed_everything(SEED)
 
-os.environ['CUDA_VISIBLE_DEVICES'] ="0"
+os.environ['CUDA_VISIBLE_DEVICES'] ="1"
 
 
 def merge_data(df1, df2):
@@ -278,8 +278,9 @@ def tta_validate(loader, model, params, fold_idx):
             stream.set_description(
                 "TTA Validation. {metric_monitor}".format(metric_monitor=metric_monitor)
             )
-        pred_val = pd.DataFrame(pred_list)
-        pred_val.to_csv(f'./error_analysis/val_{params["model"]}_{fold_idx}_pred.csv' ,index=False)
+        if params["distill_soft_label"]:
+            pred_val = pd.DataFrame(pred_list)
+            pred_val.to_csv(f'./error_analysis/val_{params["model"]}_{fold_idx}_pred.csv' ,index=False)
         best_acc = metric_monitor.curr_acc
         
     # print(f"Total output change: {count_change}")
@@ -299,12 +300,16 @@ if __name__ == "__main__":
     models_name = ["resnest26d","resnest50d","tf_efficientnet_b3_ns"]
     WEIGHTS = [
         #"./weights/resnest50d/resnest50d_fold0_best_epoch_30_final_1st.pth",
-        "./weights/resnest50d/resnest50d_fold0_best_epoch_13_final_2nd.pth",
+        # "./weights/resnest50d/resnest50d_fold0_best_epoch_13_final_2nd.pth",
+        # "./weights/resnest50d/resnest50d_fold0_best_epoch_10_final_3rd.pth",
+        "./weights/resnest50d/resnest50d_fold0_best_epoch_16_final_4th.pth",
         # "./weights/resnest50d/resnest50d_fold1_best_epoch_95_final_1st.pth",
         "./weights/resnest50d/resnest50d_fold1_best_epoch_17_final_2nd.pth",
         # "./weights/resnest50d/resnest50d_fold2_best_epoch_50_final_1st.pth",
         "./weights/resnest50d/resnest50d_fold2_best_epoch_22_final_2nd.pth",
-        "./weights/resnest50d/resnest50d_fold3_best_epoch_2_final_2nd.pth",
+        # "./weights/resnest50d/resnest50d_fold3_best_epoch_2_final_2nd.pth",
+        # "./weights/resnest50d/resnest50d_fold3_best_epoch_1_final_3rd.pth",
+        "./weights/resnest50d/resnest50d_fold3_best_epoch_2_final_4th.pth",
         # "./weights/resnest50d/resnest50d_fold4_best_epoch_10_final_2nd.pth",
         "./weights/resnest50d/resnest50d_fold4_best_epoch_15_final_3rd.pth"
         
@@ -323,7 +328,7 @@ if __name__ == "__main__":
     params = {
         "visualize": False,
         "fold": [0,1,2,3,4],
-        "distill_soft_label":True,
+        "distill_soft_label":False,
         "train_external": True,
         "test_external": False,
         "load_pretrained": True,

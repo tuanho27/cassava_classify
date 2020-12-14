@@ -101,8 +101,7 @@ class TrainDataset(Dataset):
         self.transform = transform
         self.mosaic_mix = mosaic_mix
         self.rand_aug_fn = RandAugment()
-        if soft_df is not None:
-            self.distill_soft_target = soft_df 
+        self.distill_soft_target = soft_df 
         
     def __len__(self):
         return len(self.df)
@@ -254,28 +253,24 @@ def train_epoch(train_loader, model, criterion, optimizer, epoch, params, scaler
         mix_decision = np.random.rand()
         images = images.to(params["device"]) #, non_blocking=True)
         target = target.to(params["device"]) #, non_blocking=True) #.view(-1,params['batch_size'])
-        # if mix_decision < 0.25:
         if params["mix_up"]:
             images , mtarget = mixup_fn(images, target)
             if params["distill_soft_label"]:
                 
                 mtarget = mtarget*0.7 + soft_target.to(params['device']) * 0.3
-        # elif mix_decision >=0.25 and mix_decision < 0.5:
-        #     if params["fmix"]:
-        #         images , ftarget = fmix(images, target, alpha=1., decay_power=5.,
-        #                             shape=(params["image_size"],params["image_size"]),
-        #                             device=params["device"])
+            if params["fmix"] and not params["mix_up"]:
+                images , ftarget = fmix(images, target, alpha=1., decay_power=5.,
+                                    shape=(params["image_size"],params["image_size"]),
+                                    device=params["device"])
             output = model(images)
             if isinstance(output, (tuple, list)):
                 output = output[0]
 
             loss = criterion(output, mtarget)
-                
-            # if mix_decision < 0.25:
-            #     loss = criterion(output, mtarget)
-            # else:
-            #     loss = criterion_fmix(output, ftarget[0]) * ftarget[2] + criterion_fmix(output, ftarget[1]) * (1. - ftarget[2])
-            
+            if params["fmix"] and not params["mix_up"]:
+                loss = criterion_fmix(output, ftarget[0]) * ftarget[2] + criterion_fmix(output, ftarget[1]) * (1. - ftarget[2])
+            else:
+                loss = criterion(output, mtarget)
             # loss1 = symetric_criterion(output, target)
             # loss2 = asymetric_criterion(output, target)
             
@@ -300,7 +295,7 @@ def validate(val_loader, model, criterion, epoch, params, fold, best_acc):
     model.eval()
     stream = tqdm(val_loader)
     with torch.no_grad():
-        for i, (images, target, _) in enumerate(stream, start=1):
+        for i, (images, target,_ , _) in enumerate(stream, start=1):
             images = images.to(params["device"], non_blocking=True)
             target = target.to(params["device"], non_blocking=True)#.view(-1,params['batch_size'])
             output = model(images)
@@ -317,8 +312,9 @@ def validate(val_loader, model, criterion, epoch, params, fold, best_acc):
         #to save weight
         if (metric_monitor.curr_acc > best_acc): # or epoch == params["epochs"]:
             print(f"Save best weight at acc {round(metric_monitor.curr_acc,4)}, epoch: {epoch}")
-            if not os.path.exists(params["model"]):
-                os.makedirs(params["model"])
+            directory = f'weights/{params["model"]}'
+            if not os.path.exists(directory):
+                os.makedirs(directory)
             torch.save({'model': model.state_dict(), 
                 'loss': loss,
                 'preds': round(metric_monitor.curr_acc,4)},
