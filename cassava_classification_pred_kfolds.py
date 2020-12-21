@@ -48,7 +48,6 @@ def merge_data(df1, df2):
     merge_df = pd.concat([df1, df2], axis=0) #,how ='outer', on ='image_id')
     return merge_df
 
-
 def balance_data(df, mode="undersampling", val=False):
     class_0 = df[df.label==0]
     class_1 = df[df.label==1]
@@ -209,6 +208,26 @@ class MetricMonitor:
                 for (metric_name, metric) in self.metrics.items()
             ]
         )
+
+def declare_pred_model(name, load_pretrained=False, weight=None):
+    model = timm.create_model(name,
+            pretrained=False,
+            num_classes=params["num_classes"],
+            drop_rate=params["drop_rate"])
+    model = model.to(params["device"])
+    
+    if params["distributed"]:
+        assert ValueError("No need to implement in a single machine")
+    else:
+        model = torch.nn.DataParallel(model) 
+        
+    if load_pretrained:
+        state_dict = torch.load(weight)
+        print(f"Load pretrained model: {name} ",state_dict["preds"])
+        model.load_state_dict(state_dict["model"])
+        best_acc = state_dict["preds"]   
+    return model         
+        
 def gmean(input_x, dim):
     log_x = torch.log(input_x)
     return torch.exp(torch.mean(log_x, dim=dim))
@@ -283,7 +302,7 @@ def tta_validate(loader, model, params, fold_idx):
             pred_val.to_csv(f'./error_analysis/val_{params["model"]}_{fold_idx}_pred.csv' ,index=False)
         best_acc = metric_monitor.curr_acc
         
-    # print(f"Total output change: {count_change}")
+    print(f"Total output change: {count_change}")
     return best_acc
 
 if __name__ == "__main__":
@@ -297,21 +316,22 @@ if __name__ == "__main__":
     label_map = pd.read_json(f'{root}/label_num_to_disease_map.json', 
                             orient='index')
 
-    models_name = ["resnest26d","resnest50d","tf_efficientnet_b3_ns"]
+    models_name = ["resnest26d","resnest50d","tf_efficientnet_b3_ns", "tf_efficientnet_b4_ns"]
     WEIGHTS = [
         #"./weights/resnest50d/resnest50d_fold0_best_epoch_30_final_1st.pth",
         # "./weights/resnest50d/resnest50d_fold0_best_epoch_13_final_2nd.pth",
         # "./weights/resnest50d/resnest50d_fold0_best_epoch_10_final_3rd.pth",
-        "./weights/resnest50d/resnest50d_fold0_best_epoch_16_final_4th.pth",
-        # "./weights/resnest50d/resnest50d_fold1_best_epoch_95_final_1st.pth",
-        "./weights/resnest50d/resnest50d_fold1_best_epoch_17_final_2nd.pth",
-        # "./weights/resnest50d/resnest50d_fold2_best_epoch_50_final_1st.pth",
-        "./weights/resnest50d/resnest50d_fold2_best_epoch_22_final_2nd.pth",
-        # "./weights/resnest50d/resnest50d_fold3_best_epoch_2_final_2nd.pth",
+        # # "./weights/resnest50d/resnest50d_fold1_best_epoch_95_final_1st.pth",
+        # "./weights/resnest50d/resnest50d_fold1_best_epoch_17_final_2nd.pth",
+        # "./weights/resnest50d/resnest50d_fold1_best_epoch_8_final_5th_pseudo.pth",
+        # # "./weights/resnest50d/resnest50d_fold2_best_epoch_50_final_1st.pth",
+        # "./weights/resnest50d/resnest50d_fold2_best_epoch_22_final_2nd.pth",
+        # # "./weights/resnest50d/resnest50d_fold3_best_epoch_2_final_2nd.pth",
         # "./weights/resnest50d/resnest50d_fold3_best_epoch_1_final_3rd.pth",
-        "./weights/resnest50d/resnest50d_fold3_best_epoch_2_final_4th.pth",
-        # "./weights/resnest50d/resnest50d_fold4_best_epoch_10_final_2nd.pth",
-        "./weights/resnest50d/resnest50d_fold4_best_epoch_15_final_3rd.pth"
+        # # "./weights/resnest50d/resnest50d_fold4_best_epoch_10_final_2nd.pth",
+        # "./weights/resnest50d/resnest50d_fold4_best_epoch_15_final_3rd.pth" ,
+        # "./weights/resnest50d/resnest50d_fold4_best_epoch_1_final_5th_pseudo.pth",
+        # "./weights/resnest50d/resnest50d_fold4_best_epoch_10_final-4th.pth"
         
         # "./weights/resnest26d/resnest26d_fold0_best_epoch_4_final_2nd.pth",
         # # "./weights/resnest26d/resnest26d_fold0_best_epoch_19_final_3rd.pth",
@@ -321,67 +341,53 @@ if __name__ == "__main__":
         # # "./weights/resnest26d/resnest26d_fold3_best_epoch_10_final_3rd.pth",
         # "./weights/resnest26d/resnest26d_fold4_best_epoch_21_final_2nd.pth",
         # # "./weights/resnest26d/resnest26d_fold4_best_epoch_6_final_3rd.pth",
+        
+        # "weights/tf_efficientnet_b4_ns/tf_efficientnet_b4_ns_fold0_best_epoch_75_final_1st.pth",
+        # "weights/tf_efficientnet_b4_ns/tf_efficientnet_b4_ns_fold0_best_epoch_8_final_2nd.pth",
+        "weights/tf_efficientnet_b4_ns/tf_efficientnet_b4_ns_fold0_best_epoch_3_final_3rd.pth",
+
+        # "weights/tf_efficientnet_b4_ns/tf_efficientnet_b4_ns_fold1_best_epoch_53_final_1st.pth",
+        # "weights/tf_efficientnet_b4_ns/tf_efficientnet_b4_ns_fold1_best_epoch_6_final_2nd.pth",
+        "weights/tf_efficientnet_b4_ns/tf_efficientnet_b4_ns_fold1_best_epoch_16_final_3rd.pth",
+        
+        # "weights/tf_efficientnet_b4_ns/tf_efficientnet_b4_ns_fold2_best_epoch_75_final_1st.pth",
+        # "weights/tf_efficientnet_b4_ns/tf_efficientnet_b4_ns_fold2_best_epoch_16_final_2nd.pth",
+        "weights/tf_efficientnet_b4_ns/tf_efficientnet_b4_ns_fold2_best_epoch_5_final_3rd.pth",
+        
+        # "weights/tf_efficientnet_b4_ns/tf_efficientnet_b4_ns_fold3_best_epoch_84_final_1st.pth",
+        "weights/tf_efficientnet_b4_ns/tf_efficientnet_b4_ns_fold3_best_epoch_18_final_2nd.pth",
+        
+        # "weights/tf_efficientnet_b4_ns/tf_efficientnet_b4_ns_fold4_best_epoch_66_final_1st.pth",
+        # "weights/tf_efficientnet_b4_ns/tf_efficientnet_b4_ns_fold4_best_epoch_19_final_2nd.pth",
+        "weights/tf_efficientnet_b4_ns/tf_efficientnet_b4_ns_fold4_best_epoch_20_final_3rd.pth",
+    
     ]
-    model_index = 1
+    model_index = 3
     ckpt_index = 1
 
     params = {
         "visualize": False,
         "fold": [0,1,2,3,4],
-        "distill_soft_label":False,
-        "train_external": True,
-        "test_external": False,
         "load_pretrained": True,
-        "resume": False,
         "image_size": 512,
         "num_classes": 5,
         "model": models_name[model_index],
         "device": "cuda",
-        "lr": 5e-5,
-        "lr_min":1e-6,
-        "batch_size": 16,
+        "batch_size": 8,
         "num_workers": 8,
-        "epochs": 100,
-        "gradient_accumulation_steps": 8,
         "drop_block": 0.2,
         "drop_rate": 0.2,
-        "mix_up": True,
-        "cutmix":True,
-        "rand_aug": False,
         "local_rank":0,
         "distributed": False,
-        "hard_negative_sample": False,
         "tta": True,
         "crops_tta":False,
-        "train_phase":False,
         "balance_data":False,
         "kfold_pred":True,
         "ensemble": True,
         "error_analysis":False,
     }
-    if "efficientnet" in params["model"]:
-        model = timm.create_model(
-                params["model"],
-                pretrained=False,
-                num_classes=params["num_classes"], 
-                drop_rate=params["drop_rate"], 
-                drop_path_rate=0.3)
-        
-    elif "skresnet" in params["model"]:
-        model = timm.create_model(
-                params["model"],
-                pretrained=True,
-                num_classes=params["num_classes"],
-                drop_block_rate=params["drop_block"],
-                drop_path_rate=0.2)
-    else:
-        model = timm.create_model(
-                params["model"],
-                pretrained=True,
-                num_classes=params["num_classes"],
-                drop_block_rate=params["drop_block"])
 
-    model = model.to(params["device"])
+    # model = declare_pred_model(params["model"], params["load_pretrained"], WEIGHTS[ckpt_index])
     val_criterion = nn.CrossEntropyLoss().to(params["device"])
     # criterion = nn.CrossEntropyLoss().to(params["device"])
     criterion = LabelSmoothingCrossEntropy().to(params["device"])
@@ -515,12 +521,11 @@ if __name__ == "__main__":
         test_pred_loader = DataLoader(
             test_pred_dataset, batch_size=params['batch_size'], shuffle=False, num_workers=2, pin_memory=True,
         )
-
-        state_dict = torch.load(WEIGHTS[i])
-        fold_acc = state_dict["preds"]
-        print(f"Load pretrained model: {WEIGHTS[i]} with acc: {fold_acc}")
-        model.load_state_dict(state_dict["model"])
-
+        
+        model  = declare_pred_model(params["model"], load_pretrained=params["load_pretrained"], weight=WEIGHTS[i])
         cv_acc += tta_validate(val_pred_loader, model, params, fold_idx)
+        
+        del model
+        
     num_fold_train = len(params["fold"])            
     print(f"Done CV validation with  {num_fold_train} folds, Accuracy: {round(cv_acc/num_fold_train,4)}")

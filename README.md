@@ -7,5 +7,6 @@ Create environment
     jupyter lab
     albumentation
     timm 0.3.1
+    apex
 ```
 

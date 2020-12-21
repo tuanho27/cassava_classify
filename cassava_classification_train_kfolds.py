@@ -22,12 +22,15 @@ from  torch.cuda.amp import autocast, GradScaler
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import accuracy_score
 from sklearn.utils import resample
-cudnn.benchmark = True
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, CosineAnnealingLR, ReduceLROnPlateau
 import timm
 from timm.loss import JsdCrossEntropy
 from utils import Mixup, RandAugment, AsymmetricLossSingleLabel, SCELoss, LabelSmoothingCrossEntropy, SoftTargetCrossEntropy, fmix
 from PIL import Image
+from torchcontrib.optim import SWA
+from apex import amp
+
+cudnn.benchmark = True
 SEED = 42
 
 def seed_everything(SEED):
@@ -192,6 +195,7 @@ def calculate_accuracy(output, target):
     output = torch.softmax(output, dim=1)
     return accuracy_score(output.argmax(1).cpu(), target.cpu())
 
+
 class MetricMonitor:
     def __init__(self, float_precision=3):
         self.float_precision = float_precision
@@ -216,6 +220,7 @@ class MetricMonitor:
                 for (metric_name, metric) in self.metrics.items()
             ]
         )
+
 
 def update_hard_sample(train_loader, model, val_criterion, thres):
     fig, ax = plt.subplots(nrows=1, ncols=3, figsize=(12, 6))
@@ -242,6 +247,42 @@ def update_hard_sample(train_loader, model, val_criterion, thres):
                 label=train_loss_list['label'],
                 fold=train_loss_list['fold'])
 
+
+def declare_model(params, load_pretrained=False, weight=None):
+    if "efficientnet" in params["model"]:   
+        model = timm.create_model(
+                params["model"],
+                pretrained=False,
+                num_classes=params["num_classes"], 
+                drop_rate=params["drop_rate"], 
+                drop_path_rate=0.2)
+    else:
+        model = timm.create_model(params["model"],
+                pretrained=False,
+                num_classes=params["num_classes"],
+                drop_rate=params["drop_rate"])
+    model = model.to(params["device"]) 
+    optimizer = torch.optim.Adam(model.parameters(), lr=params["lr"])
+    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=1, eta_min=params["lr_min"], last_epoch=-1)
+           
+    if params["fp16"]:
+        model, optimizer = amp.initialize(model, optimizer, opt_level="O1",verbosity=0)    
+        
+    if params["distributed"]:
+        assert ValueError("No need to implement in a single machine")
+    else:
+        model = torch.nn.DataParallel(model) 
+        
+    if load_pretrained:
+        state_dict = torch.load(weight)
+        name = params["model"]
+        print(f"Load pretrained model: {name} ",state_dict["preds"])
+        model.load_state_dict(state_dict["model"])
+        best_acc = state_dict["preds"]  
+
+    return model, optimizer, scheduler, best_acc
+
+
 def train_epoch(train_loader, model, criterion, optimizer, epoch, params, scaler=None, criterion_fmix=None):
     metric_monitor = MetricMonitor()
     model.train()
@@ -251,22 +292,28 @@ def train_epoch(train_loader, model, criterion, optimizer, epoch, params, scaler
         stream = tqdm(train_loader)
     for i, (images, target, soft_target, _) in enumerate(stream, start=1):
         mix_decision = np.random.rand()
-        images = images.to(params["device"]) #, non_blocking=True)
-        target = target.to(params["device"]) #, non_blocking=True) #.view(-1,params['batch_size'])
-        if params["mix_up"]:
-            images , mtarget = mixup_fn(images, target)
-            if params["distill_soft_label"]:
-                
-                mtarget = mtarget*0.7 + soft_target.to(params['device']) * 0.3
+        with autocast():
+            images = images.to(params["device"]) #, non_blocking=True)
+            target = target.to(params["device"]) #, non_blocking=True) #.view(-1,params['batch_size'])
+            if params["mix_up"]:
+                images , mtarget = mixup_fn(images, target)
+                if params["distill_soft_label"]:
+                    mtarget = mtarget*0.7 + soft_target.to(params['device']) * 0.3
+                    
             if params["fmix"] and not params["mix_up"]:
                 images , ftarget = fmix(images, target, alpha=1., decay_power=5.,
                                     shape=(params["image_size"],params["image_size"]),
                                     device=params["device"])
+            # try:
+            #     output = model(images)
+            # except:
+            #     import ipdb; ipdb.set_trace()
             output = model(images)
+        
             if isinstance(output, (tuple, list)):
                 output = output[0]
 
-            loss = criterion(output, mtarget)
+            # loss = criterion(output, mtarget)
             if params["fmix"] and not params["mix_up"]:
                 loss = criterion_fmix(output, ftarget[0]) * ftarget[2] + criterion_fmix(output, ftarget[1]) * (1. - ftarget[2])
             else:
@@ -281,11 +328,13 @@ def train_epoch(train_loader, model, criterion, optimizer, epoch, params, scaler
             metric_monitor.update("Loss", loss.item())
             metric_monitor.update("Accuracy", accuracy)
             optimizer.zero_grad()
-            loss.backward()
+            # loss.backward()
+            with amp.scale_loss(loss, optimizer) as scaled_loss:
+                scaled_loss.backward()
             optimizer.step()
-            # scaler.scale(loss).backward()
+            # optimizer.update_swa()
             # scaler.step(optimizer)
-            # scaler.update()
+  
             stream.set_description(
                 "Epoch: {epoch}. Train.      {metric_monitor}".format(epoch=epoch, metric_monitor=metric_monitor)
             )
@@ -329,54 +378,66 @@ if __name__ == "__main__":
     train = pd.read_csv(f'{root}/train.csv')
     train_external = pd.read_csv(f'{root}/external/train_external.csv')
     test_external = pd.read_csv(f'{root}/external/test_external.csv')
-    test_external_pseudo = pd.read_csv(f'{root}/external/test_external_pseudo.csv')
+    # test_external_pseudo = pd.read_csv(f'{root}/external/test_external_pseudo_0.8.csv')
+    test_external_pseudo = pd.read_csv(f'{root}/external/test_external_pseudo_0.8_round2.csv')
+    
     test = pd.read_csv(f'{root}/sample_submission.csv')
     label_map = pd.read_json(f'{root}/label_num_to_disease_map.json', 
                             orient='index')
 
-
-    models_name = ["resnest26d","resnest50d","tf_efficientnet_b3_ns" , "vit_base_patch16_384"]
+    models_name = ["resnest26d","resnest50d","tf_efficientnet_b3_ns" ,"tf_efficientnet_b4_ns", "vit_base_patch16_384"]
     WEIGHTS = [
-        #"./weights/resnest50d/resnest50d_fold0_best_epoch_30_final_1st.pth",
-        "./weights/resnest50d/resnest50d_fold0_best_epoch_13_final_2nd.pth",
-        # "./weights/resnest50d/resnest50d_fold1_best_epoch_95_final_1st.pth",
-        "./weights/resnest50d/resnest50d_fold1_best_epoch_17_final_2nd.pth",
-        # "./weights/resnest50d/resnest50d_fold2_best_epoch_50_final_1st.pth",
-        "./weights/resnest50d/resnest50d_fold2_best_epoch_22_final_2nd.pth",
-        "./weights/resnest50d/resnest50d_fold3_best_epoch_2_final_2nd.pth",
-        # "./weights/resnest50d/resnest50d_fold4_best_epoch_10_final_2nd.pth",
-        "./weights/resnest50d/resnest50d_fold4_best_epoch_15_final_3rd.pth"
-        
-        # "./weights/resnest26d/resnest26d_fold0_best_epoch_4_final_2nd.pth",
+    
+        # #"./weights/resnest50d/resnest50d_fold0_best_epoch_30_final_1st.pth",
+        # #"./weights/resnest50d/resnest50d_fold0_best_epoch_13_final_2nd.pth",
+        # "./weights/resnest50d/resnest50d_fold0_best_epoch_10_final_3rd.pth",
+        # #"./weights/resnest50d/resnest50d_fold1_best_epoch_95_final_1st.pth",
+        # #"./weights/resnest50d/resnest50d_fold1_best_epoch_17_final_2nd.pth",
+        # "./weights/resnest50d/resnest50d_fold1_best_epoch_8_final_5th_pseudo.pth",
+        # #"./weights/resnest50d/resnest50d_fold2_best_epoch_50_final_1st.pth",
+        # "./weights/resnest50d/resnest50d_fold2_best_epoch_22_final_2nd.pth",
+        # #"./weights/resnest50d/resnest50d_fold3_best_epoch_2_final_2nd.pth",
+        # "./weights/resnest50d/resnest50d_fold3_best_epoch_1_final_3rd.pth",
+        # #"./weights/resnest50d/resnest50d_fold4_best_epoch_10_final_2nd.pth",
+        # #"./weights/resnest50d/resnest50d_fold4_best_epoch_15_final_3rd.pth" ,
+        # #"./weights/resnest50d/resnest50d_fold4_best_epoch_10_final-4th.pth"
+        # "./weights/resnest50d/resnest50d_fold4_best_epoch_1_final_5th_pseudo.pth",
+        #
+        # # "./weights/resnest26d/resnest26d_fold0_best_epoch_4_final_2nd.pth",
+        # "weights/resnest26d/resnest26d_fold0_best_epoch_19_final_3rd.pth",
         # "./weights/resnest26d/resnest26d_fold1_best_epoch_7_final_2nd.pth",
         # "./weights/resnest26d/resnest26d_fold2_best_epoch_4_final_2nd.pth",
-        # "./weights/resnest26d/resnest26d_fold3_best_epoch_15_final_2nd.pth",
-        # "./weights/resnest26d/resnest26d_fold4_best_epoch_21_final_2nd.pth",
-
-        # "weights/resnest50d/resnest50d_fold1_best_epoch_38_clean_1st.pth"
-            
+        # # "./weights/resnest26d/resnest26d_fold3_best_epoch_15_final_2nd.pth",
+        # "weights/resnest26d/resnest26d_fold3_best_epoch_10_final_3rd.pth",
+        # # "./weights/resnest26d/resnest26d_fold4_best_epoch_21_final_2nd.pth",
+        # "weights/resnest26d/resnest26d_fold4_best_epoch_6_final_3rd.pth"
+        #
+        # "weights/tf_efficientnet_b4_ns/tf_efficientnet_b4_ns_fold0_best_epoch_75_final_1st.pth",
+        "weights/tf_efficientnet_b4_ns/tf_efficientnet_b4_ns_fold1_best_epoch_53_final_1st.pth",
+        "weights/tf_efficientnet_b4_ns/tf_efficientnet_b4_ns_fold2_best_epoch_75_final_1st.pth",
+        "weights/tf_efficientnet_b4_ns/tf_efficientnet_b4_ns_fold3_best_epoch_84_final_1st.pth",
+        "weights/tf_efficientnet_b4_ns/tf_efficientnet_b4_ns_fold4_best_epoch_66_final_1st.pth"
     ]
-    model_index = 1
-    ckpt_index = 5
-    fold_ckpt_index = [11,12]
-    fold_ckpt_weight = [1,1]
-
+    
+    model_index = 3
+    
     params = {
         "visualize": False,
-        "fold": [0,1,2,3,4],
-        "distill_soft_label": True,
-        "train_external": False,
+        "fold": [1,2,3,4],
+        "distill_soft_label": False,
+        "train_external": True,
         "train_clean_only": False,
         "test_external": False,
         "load_pretrained": True,
+        "fp16":True,
         "resume": False,
         "image_size": 512,
         "num_classes": 5,
         "model": models_name[model_index],
         "device": "cuda",
-        "lr": 1e-4,
-        "lr_min":1e-7,
-        "batch_size": 8,
+        "lr": 2e-4,
+        "lr_min":1e-8,
+        "batch_size": 16,
         "num_workers": 4,
         "epochs": 20,
         "gradient_accumulation_steps": 1,
@@ -384,7 +445,7 @@ if __name__ == "__main__":
         "drop_rate": 0.2,
         "mix_up": True,
         "cutmix":True,
-        "fmix": True,
+        "fmix": False,
         "smooth_label": 0.1,
         "rand_aug": False,
         "local_rank":0,
@@ -396,30 +457,7 @@ if __name__ == "__main__":
         "kfold_pred":False
     }
 
-
-    if "efficientnet" in params["model"]:
-        model = timm.create_model(
-                params["model"],
-                pretrained=False,
-                num_classes=params["num_classes"], 
-                drop_rate=params["drop_rate"], 
-                drop_path_rate=0.3)
-        
-    elif "skresnet" in params["model"]:
-        model = timm.create_model(
-                params["model"],
-                pretrained=True,
-                num_classes=params["num_classes"],
-                drop_block_rate=params["drop_block"],
-                drop_path_rate=0.2)
-    else:
-        model = timm.create_model(
-                params["model"],
-                pretrained=True,
-                num_classes=params["num_classes"],
-                drop_block_rate=params["drop_block"])
     scaler = GradScaler()   
-    model = model.to(params["device"])
     val_criterion = nn.CrossEntropyLoss().to(params["device"])
     criterion_fmix = nn.CrossEntropyLoss().to(params["device"])
     criterion = LabelSmoothingCrossEntropy().to(params["device"])
@@ -427,15 +465,7 @@ if __name__ == "__main__":
         criterion = SoftTargetCrossEntropy().to(params["device"])
     asymetric_criterion = AsymmetricLossSingleLabel().to(params["device"])
     symetric_criterion = SCELoss(smooth_label=params["smooth_label"]).to(params["device"])
-
-    if params["distributed"]:
-        assert ValueError("No need to implement in a single machine")
-    else:
-        model = torch.nn.DataParallel(model)    
-    optimizer = torch.optim.Adam(model.parameters(), lr=params["lr"])
-    # scheduler = CosineAnnealingLR(optimizer, T_max=10, eta_min=params["lr_min"], last_epoch=-1)
-    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=1, eta_min=params["lr_min"], last_epoch=-1)
-            
+        
     train_transform = A.Compose(
         [
             A.RandomResizedCrop(height=params["image_size"], width=params["image_size"], p=1),
@@ -497,9 +527,6 @@ if __name__ == "__main__":
             train_folds = train_external
             params["distill_soft_label"] = False
             
-        #     train_folds = pd.read_csv(f'{root}/train_{params["fold"]}_pseudo.csv')
-        #     val_folds = pd.read_csv(f'{root}/val_{params["fold"]}_pseudo.csv')    
-
         if params["test_external"]:
             train_folds = merge_data(train_folds, test_external_pseudo)
             params["distill_soft_label"] = False
@@ -517,10 +544,8 @@ if __name__ == "__main__":
                     soft_target_distill = pd.read_csv(f'./error_analysis/val_{params["model"]}_{f}_pred.csv')
                 else:
                     soft_target_distill = merge_data(soft_target_distill,  pd.read_csv(f'./error_analysis/val_{params["model"]}_{f}_pred.csv'))
-            # import ipdb; ipdb.set_trace()
             soft_target_distill = soft_target_distill.reset_index(drop=True)
             soft_target_distill = soft_target_distill.set_index('image_id').sort_index().values
-            # train_folds = train_folds.set_index('image_id').sort_index()
             train_dataset = TrainDataset(train_folds, transform=train_transform, soft_df=soft_target_distill)
         else:
             train_dataset = TrainDataset(train_folds, transform=train_transform)            
@@ -539,10 +564,8 @@ if __name__ == "__main__":
         )
 
         if params["load_pretrained"]:
-            state_dict = torch.load(WEIGHTS[i])
-            print("Load pretrained model: ",state_dict["preds"])
-            model.load_state_dict(state_dict["model"])
-            best_acc = state_dict["preds"]
+            model, optimizer, scheduler, best_acc = declare_model(params, load_pretrained=True, weight=WEIGHTS[i])
+
             # Hard negative mining based on train data and pretrained model on that data
             if params["hard_negative_sample"]:
                 update_train_data = update_hard_sample(train_loader, model, val_criterion, thres=0.2)
@@ -552,10 +575,14 @@ if __name__ == "__main__":
                 update_train_dataset = TrainDataset(update_train_folds, transform=train_transform)
                 update_train_loader = DataLoader(
                     update_train_dataset, batch_size=params["batch_size"], shuffle=True, num_workers=params["num_workers"], pin_memory=True,
-                )                
+                )  
         else:
-            best_acc = 0.
+            model, optimizer, scheduler, best_acc = declare_model(params, load_pretrained=False, weight=WEIGHTS[i])
+            best_acc = 0.85 #to avoid saving too many ckpt
             
         for epoch in range(1, params["epochs"] + 1):
             train_epoch(train_loader, model, criterion, optimizer, epoch, params, scaler,criterion_fmix=criterion_fmix)
             best_acc = validate(val_loader, model, criterion, epoch, params, fold, best_acc)
+        
+        del model
+            
