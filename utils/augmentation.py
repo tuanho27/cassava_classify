@@ -5,7 +5,6 @@ Hacked together by / Copyright 2020 Ross Wightman'''
 
 import numpy as np
 import torch
-from .fmix import sample_mask
 
 def one_hot(x, num_classes, on_value=1., off_value=0., device='cuda'):
     x = x.long().view(-1, 1)
@@ -209,14 +208,3 @@ class Mixup:
         target = mixup_target(target, self.num_classes, lam, self.label_smoothing)
         return x, target
 
-
-def fmix(data, targets, alpha, decay_power, shape, device, max_soft=0.0, reformulate=False):
-    lam, mask = sample_mask(alpha, decay_power, shape, max_soft, reformulate)
-    indices = torch.randperm(data.size(0))
-    shuffled_data = data[indices]
-    shuffled_targets = targets[indices]
-    x1 = torch.from_numpy(mask).to(device)*data
-    x2 = torch.from_numpy(1-mask).to(device)*shuffled_data
-    targets=(targets, shuffled_targets, lam)
-    
-    return (x1+x2).float(), targets

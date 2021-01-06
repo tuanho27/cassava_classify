@@ -23,12 +23,14 @@ from sklearn.metrics import accuracy_score
 from sklearn.utils import resample
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as T
-cudnn.benchmark = True
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, CosineAnnealingLR, ReduceLROnPlateau
 import timm
 from timm.loss import JsdCrossEntropy
 from utils import Mixup, RandAugment, AsymmetricLossSingleLabel, SCELoss, LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
+from utils import merge_data, balance_data, TrainDataset, TestDataset
 from PIL import Image
+
+cudnn.benchmark = True
 SEED = 42
 
 def seed_everything(SEED):
@@ -42,138 +44,6 @@ def seed_everything(SEED):
 seed_everything(SEED)
 
 os.environ['CUDA_VISIBLE_DEVICES'] ="1"
-
-
-def merge_data(df1, df2):
-    merge_df = pd.concat([df1, df2], axis=0) #,how ='outer', on ='image_id')
-    return merge_df
-
-def balance_data(df, mode="undersampling", val=False):
-    class_0 = df[df.label==0]
-    class_1 = df[df.label==1]
-    class_2 = df[df.label==2]
-    class_3 = df[df.label==3]
-    class_4 = df[df.label==4]
-    if mode == "undersampling":
-        # upsample minority
-        class_3_downsampled = resample(class_3,
-                                  replace=True, # sample with replacement
-                                  n_samples=int(len(class_3)*2/3), # match number in majority class
-                                  random_state=27) # reproducible results
-        if val:
-            return  pd.concat([class_0, class_1, class_2, class_3_downsampled, class_4]) 
-    
-        class_1_downsampled = resample(class_1,
-                          replace=True, # sample with replacement
-                          n_samples=int(len(class_1)*0.7), # match number in majority class
-                          random_state=27) # reproducible results
-        class_4_upsampled = resample(class_4,
-                          replace=True, # sample with replacement
-                          n_samples=int(len(class_4)*1.3), # match number in majority class
-                          random_state=27) # reproducible results
-        return pd.concat([class_0, class_1_downsampled, class_2, class_3_downsampled, class_4_upsampled]) 
-    else:
-        class_0_upsampled = resample(class_0,
-                          replace=True, # sample with replacement
-                          n_samples=int(len(class_3)/4), # match number in majority class
-                          random_state=27) # reproducible results
-        class_1_upsampled = resample(class_1,
-                          replace=True, # sample with replacement
-                          n_samples=int(len(class_3)/3), # match number in majority class
-                          random_state=27) # reproducible results
-        class_2_upsampled = resample(class_2,
-                          replace=True, # sample with replacement
-                          n_samples=int(len(class_3)/3), # match number in majority class
-                          random_state=27) # reproducible results
-        class_4_upsampled = resample(class_4,
-                          replace=True, # sample with replacement
-                          n_samples=int(len(class_3)/3), # match number in majority class
-                          random_state=27) # reproducible results
-        return pd.concat([class_0_upsampled, class_1_upsampled, class_2_upsampled, class_3, class_4_upsampled]) 
-
-
-# Dataset
-class TrainDataset(Dataset):
-    def __init__(self, df, transform=None, mosaic_mix = False):
-        self.df = df
-        self.file_names = df['image_id'].values
-        self.labels = df['label'].values
-        self.transform = transform
-        self.mosaic_mix = mosaic_mix
-        self.rand_aug_fn = RandAugment()
-        
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        file_name = self.file_names[idx]
-        file_path = f'{root}/train_images/{file_name}'
-        image = cv2.imread(file_path)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        label = torch.tensor(self.labels[idx]).long()
-        if params["rand_aug"]:
-            image = np.array(self.rand_aug_fn(Image.fromarray(image)))
-        if self.transform:
-            augmented = self.transform(image=image)
-            image = augmented['image']
-
-        return image, label, file_name
-    
-
-class TestDataset(Dataset):
-    def __init__(self, df, transform=None, valid_test=False, fcrops=False):
-        self.df = df
-        self.file_names = df['image_id'].values
-        self.transform = transform
-        self.valid_test = valid_test
-        self.fcrops = fcrops
-        if self.valid_test:
-            self.labels = df['label'].values  
-        else:
-            assert ValueError("Test data does not have annotation, plz check!")
-        
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        file_name = self.file_names[idx]
-        if self.valid_test:
-            file_path = f'{root}/train_images/{file_name}'
-            #file_path = f'{root}/external/extraimages/{file_name}'
-        else:
-            file_path = f'{root}/test_images/{file_name}'
-        image = cv2.imread(file_path)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        if isinstance(self.transform, list):
-            outputs = {'images':[],
-                       'labels':[],
-                       'image_ids':[]}
-            if self.fcrops:
-                for trans in self.transform:
-                    image_aug = transforms.ToPILImage()(image)
-                    image_aug = trans(image_aug)
-                    outputs["images"].append(image_aug)
-                    del image_aug
-            else:
-                for trans in self.transform:
-                    augmented = trans(image=image)
-                    image_aug = augmented['image']
-                    outputs["images"].append(image_aug)
-                    del image_aug
-
-            if self.valid_test:
-                label = torch.tensor(self.labels[idx]).long()
-                outputs['labels'] = len(self.transform)*[label]
-                outputs['image_ids'].append(file_name)
-                
-            else:
-                outputs['labels'] = len(self.transform)*[-1]
-                
-            return outputs
-        else:
-            augmented = self.transform(image=image)
-            image = augmented['image'] 
-        return image
 
 def calculate_accuracy(output, target):
 #     return torch.true_divide((target == output).sum(dim=0), output.size(0)).item()
@@ -251,8 +121,6 @@ def tta_validate(loader, model, params, fold_idx):
     count_change = 0
     with torch.no_grad():
         for i, data in enumerate(stream, start=1):
-            if params["visualize"]:
-                visualize_tta(data, pred)
             tta_output = []   
             for i, image in enumerate(data["images"]):
                 out = torch.softmax(model(image), dim=1)
@@ -261,7 +129,7 @@ def tta_validate(loader, model, params, fold_idx):
 #             output = torch.softmax(tta_output, dim=1)
             pred = output.argmax(1)
 
-            topk_output, topk_ids = torch.topk(output, params["num_classes"])
+            # topk_output, topk_ids = torch.topk(output, params["num_classes"])
             for i in range(len(data["labels"][0])):
                 if params["distill_soft_label"]:
                     pred_list['image_id'].append(data["image_ids"][0][i])
@@ -318,48 +186,37 @@ if __name__ == "__main__":
 
     models_name = ["resnest26d","resnest50d","tf_efficientnet_b3_ns", "tf_efficientnet_b4_ns"]
     WEIGHTS = [
+
+        # "./weights/resnest26d/resnest26d_fold0_best_epoch_4_final_2nd.pth",
+        "./weights/resnest26d/resnest26d_fold1_best_epoch_7_final_2nd.pth",
+        "./weights/resnest26d/resnest26d_fold2_best_epoch_4_final_2nd.pth",
+        # "./weights/resnest26d/resnest26d_fold3_best_epoch_58.pth",
+        # "./weights/resnest26d/resnest26d_fold4_best_epoch_21_final_2nd.pth",
+        # #
+        # "./weights/tf_efficientnet_b3_ns/tf_efficientnet_b3_ns_fold1_best_epoch_19_external.pth", 
+        "./weights/tf_efficientnet_b3_ns/tf_efficientnet_b3_ns_fold1_best_epoch_1_final_512.pth",
+        # "./weights/tf_efficientnet_b3_ns/tf_efficientnet_b3_ns_fold1_best_epoch_26_512.pth",
+
         #"./weights/resnest50d/resnest50d_fold0_best_epoch_30_final_1st.pth",
         # "./weights/resnest50d/resnest50d_fold0_best_epoch_13_final_2nd.pth",
-        # "./weights/resnest50d/resnest50d_fold0_best_epoch_10_final_3rd.pth",
-        # # "./weights/resnest50d/resnest50d_fold1_best_epoch_95_final_1st.pth",
+        "./weights/resnest50d/resnest50d_fold0_best_epoch_10_final_3rd.pth",
+        # "./weights/resnest50d/resnest50d_fold1_best_epoch_95_final_1st.pth",
         # "./weights/resnest50d/resnest50d_fold1_best_epoch_17_final_2nd.pth",
-        # "./weights/resnest50d/resnest50d_fold1_best_epoch_8_final_5th_pseudo.pth",
-        # # "./weights/resnest50d/resnest50d_fold2_best_epoch_50_final_1st.pth",
-        # "./weights/resnest50d/resnest50d_fold2_best_epoch_22_final_2nd.pth",
-        # # "./weights/resnest50d/resnest50d_fold3_best_epoch_2_final_2nd.pth",
-        # "./weights/resnest50d/resnest50d_fold3_best_epoch_1_final_3rd.pth",
-        # # "./weights/resnest50d/resnest50d_fold4_best_epoch_10_final_2nd.pth",
-        # "./weights/resnest50d/resnest50d_fold4_best_epoch_15_final_3rd.pth" ,
-        # "./weights/resnest50d/resnest50d_fold4_best_epoch_1_final_5th_pseudo.pth",
-        # "./weights/resnest50d/resnest50d_fold4_best_epoch_10_final-4th.pth"
-        
-        # "./weights/resnest26d/resnest26d_fold0_best_epoch_4_final_2nd.pth",
-        # # "./weights/resnest26d/resnest26d_fold0_best_epoch_19_final_3rd.pth",
-        # "./weights/resnest26d/resnest26d_fold1_best_epoch_7_final_2nd.pth",
-        # "./weights/resnest26d/resnest26d_fold2_best_epoch_4_final_2nd.pth",
-        # "./weights/resnest26d/resnest26d_fold3_best_epoch_15_final_2nd.pth",
-        # # "./weights/resnest26d/resnest26d_fold3_best_epoch_10_final_3rd.pth",
-        # "./weights/resnest26d/resnest26d_fold4_best_epoch_21_final_2nd.pth",
-        # # "./weights/resnest26d/resnest26d_fold4_best_epoch_6_final_3rd.pth",
-        
+        "./weights/resnest50d/resnest50d_fold1_best_epoch_8_final_5th_pseudo.pth",
+        # "./weights/resnest50d/resnest50d_fold2_best_epoch_50_final_1st.pth",
+        "./weights/resnest50d/resnest50d_fold2_best_epoch_22_final_2nd.pth",
+        # "./weights/resnest50d/resnest50d_fold3_best_epoch_2_final_2nd.pth",
+        "./weights/resnest50d/resnest50d_fold3_best_epoch_1_final_3rd.pth",
+        # "./weights/resnest50d/resnest50d_fold4_best_epoch_10_final_2nd.pth",
+        "./weights/resnest50d/resnest50d_fold4_best_epoch_15_final_3rd.pth" ,
+        "./weights/resnest50d/resnest50d_fold4_best_epoch_1_final_5th_pseudo.pth",
+        "./weights/resnest50d/resnest50d_fold4_best_epoch_10_final-4th.pth"
+        #
         # "weights/tf_efficientnet_b4_ns/tf_efficientnet_b4_ns_fold0_best_epoch_75_final_1st.pth",
-        # "weights/tf_efficientnet_b4_ns/tf_efficientnet_b4_ns_fold0_best_epoch_8_final_2nd.pth",
-        "weights/tf_efficientnet_b4_ns/tf_efficientnet_b4_ns_fold0_best_epoch_3_final_3rd.pth",
-
         # "weights/tf_efficientnet_b4_ns/tf_efficientnet_b4_ns_fold1_best_epoch_53_final_1st.pth",
-        # "weights/tf_efficientnet_b4_ns/tf_efficientnet_b4_ns_fold1_best_epoch_6_final_2nd.pth",
-        "weights/tf_efficientnet_b4_ns/tf_efficientnet_b4_ns_fold1_best_epoch_16_final_3rd.pth",
-        
         # "weights/tf_efficientnet_b4_ns/tf_efficientnet_b4_ns_fold2_best_epoch_75_final_1st.pth",
-        # "weights/tf_efficientnet_b4_ns/tf_efficientnet_b4_ns_fold2_best_epoch_16_final_2nd.pth",
-        "weights/tf_efficientnet_b4_ns/tf_efficientnet_b4_ns_fold2_best_epoch_5_final_3rd.pth",
-        
         # "weights/tf_efficientnet_b4_ns/tf_efficientnet_b4_ns_fold3_best_epoch_84_final_1st.pth",
-        "weights/tf_efficientnet_b4_ns/tf_efficientnet_b4_ns_fold3_best_epoch_18_final_2nd.pth",
-        
         # "weights/tf_efficientnet_b4_ns/tf_efficientnet_b4_ns_fold4_best_epoch_66_final_1st.pth",
-        # "weights/tf_efficientnet_b4_ns/tf_efficientnet_b4_ns_fold4_best_epoch_19_final_2nd.pth",
-        "weights/tf_efficientnet_b4_ns/tf_efficientnet_b4_ns_fold4_best_epoch_20_final_3rd.pth",
     
     ]
     model_index = 3
@@ -387,18 +244,6 @@ if __name__ == "__main__":
         "error_analysis":False,
     }
 
-    # model = declare_pred_model(params["model"], params["load_pretrained"], WEIGHTS[ckpt_index])
-    val_criterion = nn.CrossEntropyLoss().to(params["device"])
-    # criterion = nn.CrossEntropyLoss().to(params["device"])
-    criterion = LabelSmoothingCrossEntropy().to(params["device"])
-    if params["mix_up"]:
-        criterion = SoftTargetCrossEntropy().to(params["device"])
-
-    if params["distributed"]:
-        assert ValueError("No need to implement in a single machine")
-    else:
-        model = torch.nn.DataParallel(model)    
-        
     val_transform = A.Compose(
         [
             A.CenterCrop(height=params["image_size"], width=params["image_size"], p=1),
@@ -484,33 +329,18 @@ if __name__ == "__main__":
         train_folds = folds.loc[train_idx].reset_index(drop=True)
         val_folds = folds.loc[val_idx].reset_index(drop=True)
 
-        for idx,label in enumerate(train_external['label']):
-            train_external.loc[idx,'fold'] = fold
-        train_external['fold'] = train_external['fold'].astype(int)
-        if params["train_external"]:
-            train_folds = merge_data(train_folds, train_external)
-        #     train_folds = pd.read_csv(f'{root}/train_{params["fold"]}_pseudo.csv')
-        #     val_folds = pd.read_csv(f'{root}/val_{params["fold"]}_pseudo.csv')    
-
-        if params["test_external"]:
-            train_folds = merge_data(train_folds, test_external_pseudo)
-            
         if params["balance_data"]:
             train_folds = balance_data(train_folds, mode="undersampling")    
             val_folds = balance_data(val_folds, mode="undersampling", val=True)
 
-        train_dataset = TestDataset(train_folds, transform=test_transform_tta, valid_test=True)
-        train_loader = DataLoader(
-            train_dataset, batch_size=params["batch_size"], shuffle=True, num_workers=params["num_workers"], pin_memory=True,
-        )
         if params["tta"]:
-            val_pred_dataset = TestDataset(val_folds, transform=test_transform_tta, valid_test=True)
-            test_pred_dataset = TestDataset(test, transform=test_transform_tta)
+            val_pred_dataset = TestDataset(val_folds, root, transform=test_transform_tta, valid_test=True)
+            test_pred_dataset = TestDataset(test, root, transform=test_transform_tta)
         else:
-            val_pred_dataset = TestDataset(val_folds, transform=val_transform, valid_test=True)
-            test_pred_dataset = TestDataset(test, transform=val_transform)
+            val_pred_dataset = TestDataset(val_folds, root, transform=val_transform, valid_test=True)
+            test_pred_dataset = TestDataset(test, root, transform=val_transform)
 
-        val_pred_dataset_crops = TestDataset(val_folds, transform=test_transform_tta_crops,valid_test=True, fcrops=True)
+        val_pred_dataset_crops = TestDataset(val_folds, root, transform=test_transform_tta_crops,valid_test=True, fcrops=True)
 
         val_pred_loader = DataLoader(
             val_pred_dataset, batch_size=params['batch_size'], shuffle=False, num_workers=2, pin_memory=True,
