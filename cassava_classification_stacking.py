@@ -255,7 +255,7 @@ if __name__ == "__main__":
     label_map = pd.read_json(f'{root}/label_num_to_disease_map.json', 
                             orient='index')
     
-    stack_models = ["resnest26d","resnest50d", "tf_efficientnet_b4_ns"]
+    models_name = ["resnest26d","resnest50d", "tf_efficientnet_b4_ns", "legacy_seresnext26_32x4d"]
     WEIGHTS_26 = [
             "/home/tuanho/Downloads/cassava/stacking/data/resnest26/resnest26d_fold0_best_epoch_19_final_3rd.pth",
             "/home/tuanho/Downloads/cassava/stacking/data/resnest26/resnest26d_fold1_best_epoch_7_final_2nd.pth",
@@ -275,6 +275,13 @@ if __name__ == "__main__":
             "/home/tuanho/Downloads/cassava/stacking/data/effb4/tf_efficientnet_b4_ns_fold3_best_epoch_14_final_2nd.pth",
             "/home/tuanho/Downloads/cassava/stacking/data/effb4/tf_efficientnet_b4_ns_fold4_best_epoch_20_final_3rd.pth"]
     
+    WEIGHTS_se26 = [
+         "/home/tuanho/Downloads/cassava/stacking/data/seresnext26/legacy_seresnext26_32x4d_fold0_best_epoch_29_final_4th.pth",
+         "/home/tuanho/Downloads/cassava/stacking/data/seresnext26/legacy_seresnext26_32x4d_fold1_best_epoch_21_final_5th.pth",
+         "/home/tuanho/Downloads/cassava/stacking/data/seresnext26/legacy_seresnext26_32x4d_fold2_best_epoch_26_final_5th.pth",
+         "/home/tuanho/Downloads/cassava/stacking/data/seresnext26/legacy_seresnext26_32x4d_fold3_best_epoch_4_final_5th.pth",
+         "/home/tuanho/Downloads/cassava/stacking/data/seresnext26/legacy_seresnext26_32x4d_fold4_best_epoch_17_final_5th.pth"]
+
     params = {
         "visualize": False,
         "fold": [0,1,2,3,4],
@@ -283,10 +290,10 @@ if __name__ == "__main__":
         "num_classes": 5,
         "device": "cuda",
         "fp16": False,
-        "batch_size": 64,
+        "batch_size": 1,
         "lr": 1e-3,
         "lr_min": 1e-8,
-        "epochs": 100,
+        "epochs": 70,
         "num_workers": 2,
         "mix_up":True,
         "fmix":False,
@@ -294,7 +301,7 @@ if __name__ == "__main__":
         "drop_rate": 0.2,
         "tta": True,
         "device":"cuda:0",
-        "create_data":False,
+        "create_data": False,
         "smooth_label": 0.1,
         "gradient_accumulation_steps":1
     }
@@ -369,6 +376,11 @@ if __name__ == "__main__":
         "targets": [],
         "image_ids":[]
     }
+    se26_logit_preds = {
+        "logits":[],
+        "targets": [],
+        "image_ids":[]
+    }
     # outputs_r26_h5f = h5py.File('../data/result_r26.h5', 'w')
     # outputs_r50_h5f = h5py.File('../data/result_r50.h5', 'w')
     # outputs_eb4_h5f = h5py.File('../data/result_eb4.h5', 'w')
@@ -377,6 +389,7 @@ if __name__ == "__main__":
         r26_data = torch.load(f'../data/result_r26_5folds.pth')
         r50_data = torch.load(f'../data/result_r50_5folds.pth')  
         eb4_data = torch.load( f'../data/result_eb4_5folds.pth')  
+        se26_data = torch.load( f'../data/result_se26_5folds.pth')  
 
     for fold_idx in range(5):
         fold = fold_idx
@@ -396,6 +409,8 @@ if __name__ == "__main__":
             r26_model = declare_pred_model(models_name[0], WEIGHTS_26[fold_idx])
             r50_model = declare_pred_model(models_name[1], WEIGHTS_50[fold_idx])
             eb4_model = declare_pred_model(models_name[2], WEIGHTS_b4[fold_idx])
+            se26_model = declare_pred_model(models_name[3], WEIGHTS_se26[fold_idx])
+
 
             r26_outputs = tta_stack_validate(val_pred_loader, r26_model, params, fold_idx)
             r26_logit_preds["logits"].append(r26_outputs[0])
@@ -411,9 +426,14 @@ if __name__ == "__main__":
             eb4_logit_preds["logits"].append(eb4_outputs[0])
             eb4_logit_preds["targets"].append(eb4_outputs[1])
             eb4_logit_preds["image_ids"].append(eb4_outputs[2])
+
+            se26_outputs = tta_stack_validate(val_pred_loader, se26_model, params, fold_idx)
+            se26_logit_preds["logits"].append(se26_outputs[0])
+            se26_logit_preds["targets"].append(se26_outputs[1])
+            se26_logit_preds["image_ids"].append(se26_outputs[2])
         else:
-            print("************** Start Training Stacking model **************\n")
-            stack_model = CNNStackModel(params["num_classes"], len(stack_models))
+            print(f"************** Start Training Stacking model Fold: {fold_idx} **************\n")
+            stack_model = CNNStackModel(params["num_classes"], len(models_name))
             stack_model = stack_model.to(params["device"])
             stack_model = torch.nn.DataParallel(stack_model) 
 
@@ -421,10 +441,12 @@ if __name__ == "__main__":
             train_data = torch.stack([torch.cat([r26_data["preds"]["logits"][f] for f in train_list]),
                                      torch.cat([r50_data["preds"]["logits"][f] for f in train_list]),
                                      torch.cat([eb4_data["preds"]["logits"][f] for f in train_list]),
+                                     torch.cat([se26_data["preds"]["logits"][f] for f in train_list]),
                                     ])
             val_data = torch.stack([r26_data["preds"]["logits"][fold_idx],
                                     r50_data["preds"]["logits"][fold_idx],
-                                    eb4_data["preds"]["logits"][fold_idx]
+                                    eb4_data["preds"]["logits"][fold_idx],
+                                    se26_data["preds"]["logits"][fold_idx]
                                     ])
             train_data = train_data.transpose(1,0)
             val_data = val_data.transpose(1,0)
@@ -439,10 +461,10 @@ if __name__ == "__main__":
             val_dataset = StackTrainDataset(val_data, val_labels, transform=val_transform)
 
             train_loader = DataLoader(
-                train_dataset, batch_size=params["batch_size"], shuffle=True, pin_memory=True,
+                train_dataset, batch_size=128, shuffle=True, pin_memory=True,
             )
             val_loader = DataLoader(
-                val_dataset, batch_size=params["batch_size"], shuffle=False, pin_memory=True,
+                val_dataset, batch_size=128, shuffle=False, pin_memory=True,
             )
             criterion = LabelSmoothingCrossEntropy().to(params["device"])
             val_criterion = nn.CrossEntropyLoss().to(params["device"])
@@ -457,9 +479,12 @@ if __name__ == "__main__":
         # outputs_r26_h5f.create_dataset(f'r26{}', data=r26_logit_preds) 
         # outputs_r50_h5f.create_dataset(f'r50{}', data=r50_logit_preds) 
         # outputs_eb4_h5f.create_dataset(f'eb4{}', data=eb4_logit_preds) 
+
         torch.save({'preds': r26_logit_preds}, f'../data/result_r26_5folds.pth') 
         torch.save({'preds': r50_logit_preds}, f'../data/result_r50_5folds.pth')  
-        torch.save({'preds': eb4_logit_preds}, f'../data/result_eb4_5folds.pth')  
+        torch.save({'preds': eb4_logit_preds}, f'../data/result_eb4_5folds.pth')
+        torch.save({'preds': se26_logit_preds}, f'../data/result_se26_5folds.pth')
+
 
     # opt_acc, opt_weight = optimize_weight(gts, preds, stype=args.stype)
  
