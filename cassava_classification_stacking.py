@@ -29,7 +29,7 @@ import timm
 from timm.loss import JsdCrossEntropy
 from utils import Mixup, RandAugment, AsymmetricLossSingleLabel, SCELoss, LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from PIL import Image
-from utils import merge_data, balance_data, TrainDataset, TestDataset
+from utils import merge_data, balance_data, TrainDataset
 import h5py
 import torch.nn.functional as F
 
@@ -50,14 +50,22 @@ class CNNStackModel(nn.Module):
         super(CNNStackModel, self).__init__()
         self.conv1 = nn.Sequential(
             nn.Conv2d(num_channels, 256, kernel_size=(1,3), stride=1, padding=0),
+            nn.BatchNorm2d(num_features=256),
             nn.ReLU(inplace=True),
             nn.Conv2d(256, 512, kernel_size=(3,1), stride=1, padding=0),
+            nn.BatchNorm2d(num_features=512),
             nn.ReLU(inplace=True),
         )
         self.fc1 = nn.Linear(512, 1024, bias=True)
         self.fc2 = nn.Linear(1024, 1024, bias=True)
         self.last_linear = nn.Linear(1024, num_classes, bias=True)
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        # self.init_layer()
+
+    def init_layer(self):
+        for layer in self.conv1:
+            if "Conv2d" in str(layer):
+                torch.nn.init.kaiming_uniform_(layer.weight)
 
     def forward(self, x):
         x = self.conv1(x)
@@ -71,6 +79,56 @@ class CNNStackModel(nn.Module):
         return x
 
 # Dataset
+
+class TestDataset(Dataset):
+    def __init__(self, df, root, transform=None, valid_test=False):
+        self.df = df
+        self.root = root
+        self.file_names = df['image_id'].values
+        self.transform = transform
+        self.valid_test = valid_test
+        if self.valid_test:
+            self.labels = df['label'].values  
+        else:
+            assert ValueError("Test data does not have annotation, plz check!")
+        
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        file_name = self.file_names[idx]
+        if self.valid_test:
+            file_path = f'{self.root}/train_images/{file_name}'
+        else:
+            file_path = f'{self.root}/test_images/{file_name}'
+        image = cv2.imread(file_path)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        if isinstance(self.transform, list):
+            outputs = {'images':[],
+                       'labels':[],
+                       'image_ids':[]}
+            for trans in self.transform:
+                augmented = trans(image=image)
+                image_aug = augmented['image']
+                outputs["images"].append(image_aug)
+                del image_aug
+            if self.valid_test:
+                label = torch.tensor(self.labels[idx]).long()
+                outputs['labels'] = len(self.transform)*[label]
+                outputs['image_ids'].append(file_name)
+            else:
+                outputs['labels'] = len(self.transform)*[-1]                
+            return outputs
+        else:
+            augmented = self.transform(image=image)
+            image = augmented['image'] 
+            if self.valid_test:
+                label = torch.tensor(self.labels[idx]).long()
+            return dict(images=image, 
+                        labels=label,
+                        image_ids=file_name)
+        return image
+
 class StackTrainDataset(Dataset):
     def __init__(self, df, labels, transform=None):
         self.df = df
@@ -126,14 +184,14 @@ def declare_pred_model(name, weight):
     if "efficientnet" in name:
         model = timm.create_model(
                 name,
-                pretrained=True,
+                pretrained=False,
                 num_classes=5, 
                 drop_rate=0.2, 
                 drop_path_rate=0.3)
     else:
         model = timm.create_model(
                 name,
-                pretrained=True,
+                pretrained=False,
                 num_classes=5,
                 drop_rate=0.2)
 
@@ -143,25 +201,48 @@ def declare_pred_model(name, weight):
     print(f"Load pretrained model: {name} ",state_dict["preds"])
     model.load_state_dict(state_dict["model"])
     best_acc = state_dict["preds"]   
-    return model.eval()      
-        
+    return model.eval() 
 
-def tta_stack_validate(loader, model, params, fold_idx):
+
+def gmean(input_x, dim):
+    log_x = torch.log(input_x)
+    return torch.exp(torch.mean(log_x, dim=dim))     
+
+def tta_stack_validate(loader, model, params, fold_idx, gen_prob, tta):
     model.eval()
     stream = tqdm(loader)
     preds = []
     gts = []
-    image_ids = []                
+    image_ids = []
+    probs = []            
     with torch.no_grad():
         for i, data in enumerate(stream, start=1):
-            tta_output = []   
-            for i, image in enumerate(data["images"]):
-                logit = model(image)
-                tta_output.append(logit)
-            preds.append(torch.cat(tta_output, dim=0))
-            gts.append(data["labels"][0])
-            image_ids.extend(data["image_ids"][0])
-    return torch.stack(preds, dim=0), torch.cat(gts), image_ids
+            tta_output = []
+            tta_prob_output = []
+            if tta:
+                for i, image in enumerate(data["images"]):
+                    image = image.to(params["device"], non_blocking=True)
+                    logit = model(image)
+                    tta_output.append(logit)
+                    if gen_prob:
+                        tta_prob_output.append(torch.softmax(logit, dim=1))
+                # tta_output = torch.stack(tta_output, dim=0).mean(dim=0)
+                prob_output = torch.stack(tta_prob_output, dim=0).mean(dim=0)
+                output = torch.cat(tta_output, dim=0)
+                label = data["labels"][0]
+                img_id = data["image_ids"][0]
+            else:
+                logit = model(data["images"].to(params["device"], non_blocking=True))
+                prob_output = torch.softmax(logit, dim=1)
+                output = logit
+                label = data["labels"]
+                img_id = data["image_ids"]
+                
+            probs.append(prob_output)
+            preds.append(output)
+            gts.append(label)
+            image_ids.extend(img_id)
+    return torch.stack(preds, dim=0), torch.cat(gts), image_ids, torch.cat(probs).cpu().numpy()
 
 
 def train_epoch(train_loader, model, criterion, optimizer, epoch, params):
@@ -188,7 +269,6 @@ def train_epoch(train_loader, model, criterion, optimizer, epoch, params):
         else:
             loss = criterion(output, target)
 
-        
         if params['gradient_accumulation_steps'] > 1:
             loss = loss / params['gradient_accumulation_steps']
     
@@ -246,7 +326,7 @@ def validate(val_loader, model, criterion, optimizer, epoch, params, fold, best_
 
 if __name__ == "__main__":
     
-    root = os.path.join(os.environ["HOME"], "/home/tuanho/Downloads/cassava/stacking/data")
+    root = os.path.join(os.environ["HOME"], "Workspace/datasets/taiyoyuden/cassava")
     train = pd.read_csv(f'{root}/train.csv')
     train_external = pd.read_csv(f'{root}/external/train_external.csv')
     test_external = pd.read_csv(f'{root}/external/test_external.csv')
@@ -257,36 +337,36 @@ if __name__ == "__main__":
     
     models_name = ["resnest26d","resnest50d", "tf_efficientnet_b4_ns", "legacy_seresnext26_32x4d"]
     WEIGHTS_26 = [
-            "/home/tuanho/Downloads/cassava/stacking/data/resnest26/resnest26d_fold0_best_epoch_19_final_3rd.pth",
-            "/home/tuanho/Downloads/cassava/stacking/data/resnest26/resnest26d_fold1_best_epoch_7_final_2nd.pth",
-            "/home/tuanho/Downloads/cassava/stacking/data/resnest26/resnest26d_fold2_best_epoch_4_final_2nd.pth",
-            "/home/tuanho/Downloads/cassava/stacking/data/resnest26/resnest26d_fold3_best_epoch_10_final_3rd.pth",
-            "/home/tuanho/Downloads/cassava/stacking/data/resnest26/resnest26d_fold4_best_epoch_6_final_3rd.pth"]
+            "/home/cybercore/.tuan_temp/traffic_cassava/data/resnest26/resnest26d_fold0_best_epoch_19_final_3rd.pth",
+            "/home/cybercore/.tuan_temp/traffic_cassava/data/resnest26/resnest26d_fold1_best_epoch_7_final_2nd.pth",
+            "/home/cybercore/.tuan_temp/traffic_cassava/data/resnest26/resnest26d_fold2_best_epoch_4_final_2nd.pth",
+            "/home/cybercore/.tuan_temp/traffic_cassava/data/resnest26/resnest26d_fold3_best_epoch_10_final_3rd.pth",
+            "/home/cybercore/.tuan_temp/traffic_cassava/data/resnest26/resnest26d_fold4_best_epoch_6_final_3rd.pth"]
     WEIGHTS_50 = [
-            "/home/tuanho/Downloads/cassava/stacking/data/resnest50/resnest50d_fold0_best_epoch_10_final_3rd.pth",
-            "/home/tuanho/Downloads/cassava/stacking/data/resnest50/resnest50d_fold1_best_epoch_8_final_5th_pseudo.pth",
-            "/home/tuanho/Downloads/cassava/stacking/data/resnest50/resnest50d_fold2_best_epoch_22_final_2nd.pth",
-            "/home/tuanho/Downloads/cassava/stacking/data/resnest50/resnest50d_fold3_best_epoch_1_final_3rd.pth",
-            "/home/tuanho/Downloads/cassava/stacking/data/resnest50/resnest50d_fold4_best_epoch_1_final_5th_pseudo.pth"]
+            "/home/cybercore/.tuan_temp/traffic_cassava/data/resnest50/resnest50d_fold0_best_epoch_10_final_3rd.pth",
+            "/home/cybercore/.tuan_temp/traffic_cassava/data/resnest50/resnest50d_fold1_best_epoch_8_final_5th_pseudo.pth",
+            "/home/cybercore/.tuan_temp/traffic_cassava/data/resnest50/resnest50d_fold2_best_epoch_22_final_2nd.pth",
+            "/home/cybercore/.tuan_temp/traffic_cassava/data/resnest50/resnest50d_fold3_best_epoch_1_final_3rd.pth",
+            "/home/cybercore/.tuan_temp/traffic_cassava/data/resnest50/resnest50d_fold4_best_epoch_1_final_5th_pseudo.pth"]
     WEIGHTS_b4 = [
-            "/home/tuanho/Downloads/cassava/stacking/data/effb4/tf_efficientnet_b4_ns_fold0_best_epoch_25_final_3rd.pth",
-            "/home/tuanho/Downloads/cassava/stacking/data/effb4/tf_efficientnet_b4_ns_fold1_best_epoch_26_final_5th.pth",
-            "/home/tuanho/Downloads/cassava/stacking/data/effb4/tf_efficientnet_b4_ns_fold2_best_epoch_29_final_3rd.pth",
-            "/home/tuanho/Downloads/cassava/stacking/data/effb4/tf_efficientnet_b4_ns_fold3_best_epoch_14_final_2nd.pth",
-            "/home/tuanho/Downloads/cassava/stacking/data/effb4/tf_efficientnet_b4_ns_fold4_best_epoch_20_final_3rd.pth"]
+            "/home/cybercore/.tuan_temp/traffic_cassava/data/effb4/tf_efficientnet_b4_ns_fold0_best_epoch_25_final_3rd.pth",
+            "/home/cybercore/.tuan_temp/traffic_cassava/data/effb4/tf_efficientnet_b4_ns_fold1_best_epoch_26_final_5th.pth",
+            "/home/cybercore/.tuan_temp/traffic_cassava/data/effb4/tf_efficientnet_b4_ns_fold2_best_epoch_29_final_3rd.pth",
+            "/home/cybercore/.tuan_temp/traffic_cassava/data/effb4/tf_efficientnet_b4_ns_fold3_best_epoch_14_final_2nd.pth",
+            "/home/cybercore/.tuan_temp/traffic_cassava/data/effb4/tf_efficientnet_b4_ns_fold4_best_epoch_20_final_3rd.pth"]
     
     WEIGHTS_se26 = [
-         "/home/tuanho/Downloads/cassava/stacking/data/seresnext26/legacy_seresnext26_32x4d_fold0_best_epoch_29_final_4th.pth",
-         "/home/tuanho/Downloads/cassava/stacking/data/seresnext26/legacy_seresnext26_32x4d_fold1_best_epoch_21_final_5th.pth",
-         "/home/tuanho/Downloads/cassava/stacking/data/seresnext26/legacy_seresnext26_32x4d_fold2_best_epoch_26_final_5th.pth",
-         "/home/tuanho/Downloads/cassava/stacking/data/seresnext26/legacy_seresnext26_32x4d_fold3_best_epoch_4_final_5th.pth",
-         "/home/tuanho/Downloads/cassava/stacking/data/seresnext26/legacy_seresnext26_32x4d_fold4_best_epoch_17_final_5th.pth"]
+         "/home/cybercore/.tuan_temp/traffic_cassava/data/seresnext26/legacy_seresnext26_32x4d_fold0_best_epoch_29_final_4th.pth",
+         "/home/cybercore/.tuan_temp/traffic_cassava/data/seresnext26/legacy_seresnext26_32x4d_fold1_best_epoch_21_final_5th.pth",
+         "/home/cybercore/.tuan_temp/traffic_cassava/data/seresnext26/legacy_seresnext26_32x4d_fold2_best_epoch_26_final_5th.pth",
+         "/home/cybercore/.tuan_temp/traffic_cassava/data/seresnext26/legacy_seresnext26_32x4d_fold3_best_epoch_4_final_5th.pth",
+         "/home/cybercore/.tuan_temp/traffic_cassava/data/seresnext26/legacy_seresnext26_32x4d_fold4_best_epoch_17_final_5th.pth"]
 
     params = {
         "visualize": False,
         "fold": [0,1,2,3,4],
         "model": 'cnn-stack',
-        "image_size": 10,
+        "image_size": 512,
         "num_classes": 5,
         "device": "cuda",
         "fp16": False,
@@ -299,25 +379,33 @@ if __name__ == "__main__":
         "fmix":False,
         "drop_block": 0.2,
         "drop_rate": 0.2,
-        "tta": True,
+        "tta": False,
         "device":"cuda:0",
         "create_data": False,
+        "gen_prob": True,
         "smooth_label": 0.1,
         "gradient_accumulation_steps":1
     }
-
+    ## stack model transform 
     train_transform = A.Compose(
     [
-        # A.IAAAdditiveGaussianNoise(p=1.),
-        # A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+        A.IAAAdditiveGaussianNoise(p=0.5),
         ToTensorV2(),
     ])
     val_transform = A.Compose(
     [
-        # A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
         ToTensorV2(),
     ])
 
+    ## Level 1 model prediction transform
+    pred_transform = A.Compose(
+    [
+        A.CenterCrop(height=params["image_size"], width=params["image_size"], p=1),    
+        A.Resize(height=params["image_size"], width=params["image_size"], p=1),
+        A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),   
+        ToTensorV2(),
+    ])
+    
     transform_tta0 = A.Compose(
         [
             A.CenterCrop(height=params["image_size"], width=params["image_size"], p=1),    
@@ -360,6 +448,10 @@ if __name__ == "__main__":
     folds['fold'] = folds['fold'].astype(int)
     cv_acc = 0.
 
+    # outputs_r26_h5f = h5py.File('../data/result_r26.h5', 'w')
+    # outputs_r50_h5f = h5py.File('../data/result_r50.h5', 'w')
+    # outputs_eb4_h5f = h5py.File('../data/result_eb4.h5', 'w')
+
     ## Preds all models
     r26_logit_preds = {
         "logits":[],
@@ -381,15 +473,14 @@ if __name__ == "__main__":
         "targets": [],
         "image_ids":[]
     }
-    # outputs_r26_h5f = h5py.File('../data/result_r26.h5', 'w')
-    # outputs_r50_h5f = h5py.File('../data/result_r50.h5', 'w')
-    # outputs_eb4_h5f = h5py.File('../data/result_eb4.h5', 'w')
-
-    if not params["create_data"]:
-        r26_data = torch.load(f'../data/result_r26_5folds.pth')
-        r50_data = torch.load(f'../data/result_r50_5folds.pth')  
-        eb4_data = torch.load( f'../data/result_eb4_5folds.pth')  
-        se26_data = torch.load( f'../data/result_se26_5folds.pth')  
+    stack_probs = {
+        "image_ids":[],
+        "targets": [],
+        "m1":[],
+        "m2":[],
+        "m3":[],
+        "m4":[],
+    }
 
     for fold_idx in range(5):
         fold = fold_idx
@@ -402,7 +493,7 @@ if __name__ == "__main__":
             if params["tta"]:
                 val_pred_dataset = TestDataset(val_folds, root, transform=test_transform_tta, valid_test=True)
             else:
-                val_pred_dataset = TestDataset(val_folds, root, transform=val_transform, valid_test=True)
+                val_pred_dataset = TestDataset(val_folds, root, transform=pred_transform, valid_test=True)
             val_pred_loader = DataLoader(
                 val_pred_dataset, batch_size=params['batch_size'], shuffle=False, num_workers=2, pin_memory=True,
             )
@@ -411,27 +502,50 @@ if __name__ == "__main__":
             eb4_model = declare_pred_model(models_name[2], WEIGHTS_b4[fold_idx])
             se26_model = declare_pred_model(models_name[3], WEIGHTS_se26[fold_idx])
 
-
-            r26_outputs = tta_stack_validate(val_pred_loader, r26_model, params, fold_idx)
+            r26_outputs = tta_stack_validate(val_pred_loader, r26_model, params, fold_idx, params["gen_prob"], params["tta"])
             r26_logit_preds["logits"].append(r26_outputs[0])
             r26_logit_preds["targets"].append(r26_outputs[1])
             r26_logit_preds["image_ids"].append(r26_outputs[2])
+            print(f"Check target r26 fold {fold_idx}: {accuracy_score(val_folds['label'],r26_outputs[1].cpu().numpy())}")
+            #
+            stack_probs["m1"].append(r26_outputs[3])
+            stack_probs["image_ids"].extend(r26_outputs[2])
+            stack_probs["targets"].append(r26_outputs[1])
+            if params["tta"]:
+                print(f"TTA ACC r26 fold {fold_idx}: {accuracy_score(val_folds['label'],r26_outputs[3].argmax(1))}")
+            else:
+                print(f"ACC r26 fold {fold_idx}: {accuracy_score(val_folds['label'],r26_outputs[3].argmax(1))}")
 
-            r50_outputs = tta_stack_validate(val_pred_loader, r50_model, params, fold_idx)
+            r50_outputs = tta_stack_validate(val_pred_loader, r50_model, params, fold_idx, params["gen_prob"], params["tta"])
             r50_logit_preds["logits"].append(r50_outputs[0])
             r50_logit_preds["targets"].append(r50_outputs[1])
             r50_logit_preds["image_ids"].append(r50_outputs[2])
+            print(f"Check ACC r50 fold {fold_idx}: {accuracy_score(val_folds['label'],r50_outputs[3].cpu().numpy())}")
+            #
+            stack_probs["m2"].append(r50_outputs[3])
 
-            eb4_outputs = tta_stack_validate(val_pred_loader, eb4_model, params, fold_idx)
+            eb4_outputs = tta_stack_validate(val_pred_loader, eb4_model, params, fold_idx, params["gen_prob"], params["tta"])
             eb4_logit_preds["logits"].append(eb4_outputs[0])
             eb4_logit_preds["targets"].append(eb4_outputs[1])
             eb4_logit_preds["image_ids"].append(eb4_outputs[2])
+            print(f"Check ACC eb4 fold {fold_idx}: {accuracy_score(val_folds['label'],eb4_outputs[3].cpu().numpy())}")
+            #
+            stack_probs["m3"].append(eb4_outputs[3])
 
-            se26_outputs = tta_stack_validate(val_pred_loader, se26_model, params, fold_idx)
+            se26_outputs = tta_stack_validate(val_pred_loader, se26_model, params, fold_idx, params["gen_prob"], params["tta"])
             se26_logit_preds["logits"].append(se26_outputs[0])
             se26_logit_preds["targets"].append(se26_outputs[1])
             se26_logit_preds["image_ids"].append(se26_outputs[2])
+            print(f"Check ACC se26 fold {fold_idx}: {accuracy_score(val_folds['label'],se26_outputs[3].cpu().numpy())}")
+            #
+            stack_probs["m4"].append(se26_outputs[3])
+
         else:
+            r26_data = torch.load(f'results/result_r26_5folds.pth')
+            r50_data = torch.load(f'results/result_r50_5folds.pth')  
+            eb4_data = torch.load(f'results/result_eb4_5folds.pth')  
+            se26_data =torch.load(f'results/result_se26_5folds.pth')  
+
             print(f"************** Start Training Stacking model Fold: {fold_idx} **************\n")
             stack_model = CNNStackModel(params["num_classes"], len(models_name))
             stack_model = stack_model.to(params["device"])
@@ -479,12 +593,38 @@ if __name__ == "__main__":
         # outputs_r26_h5f.create_dataset(f'r26{}', data=r26_logit_preds) 
         # outputs_r50_h5f.create_dataset(f'r50{}', data=r50_logit_preds) 
         # outputs_eb4_h5f.create_dataset(f'eb4{}', data=eb4_logit_preds) 
+        torch.save({'preds': r26_logit_preds}, f'results_notta/result_r26_5folds.pth') 
+        torch.save({'preds': r50_logit_preds}, f'results_notta/result_r50_5folds.pth')  
+        torch.save({'preds': eb4_logit_preds}, f'results_notta/result_eb4_5folds.pth')
+        torch.save({'preds': se26_logit_preds}, f'results_notta/result_se26_5folds.pth')
+        stack_prob_out = pd.DataFrame()
+        stack_prob_out['image_id'] = np.array(stack_probs["image_ids"])
+        stack_prob_out['label'] = np.array(torch.cat(stack_probs["targets"]), dtype=int)
 
-        torch.save({'preds': r26_logit_preds}, f'../data/result_r26_5folds.pth') 
-        torch.save({'preds': r50_logit_preds}, f'../data/result_r50_5folds.pth')  
-        torch.save({'preds': eb4_logit_preds}, f'../data/result_eb4_5folds.pth')
-        torch.save({'preds': se26_logit_preds}, f'../data/result_se26_5folds.pth')
+        stack_prob_out['m1_0'] = np.concatenate(stack_probs["m1"])[:, 0]
+        stack_prob_out['m1_1'] = np.concatenate(stack_probs["m1"])[:, 1]
+        stack_prob_out['m1_2'] = np.concatenate(stack_probs["m1"])[:, 2]
+        stack_prob_out['m1_3'] = np.concatenate(stack_probs["m1"])[:, 3]
+        stack_prob_out['m1_4'] = np.concatenate(stack_probs["m1"])[:, 4]
 
+        stack_prob_out['m2_0'] = np.concatenate(stack_probs["m2"])[:, 0]
+        stack_prob_out['m2_1'] = np.concatenate(stack_probs["m2"])[:, 1]
+        stack_prob_out['m2_2'] = np.concatenate(stack_probs["m2"])[:, 2]
+        stack_prob_out['m2_3'] = np.concatenate(stack_probs["m2"])[:, 3]
+        stack_prob_out['m2_4'] = np.concatenate(stack_probs["m2"])[:, 4]
+        
+        stack_prob_out['m3_0'] = np.concatenate(stack_probs["m3"])[:, 0]
+        stack_prob_out['m3_1'] = np.concatenate(stack_probs["m3"])[:, 1]
+        stack_prob_out['m3_2'] = np.concatenate(stack_probs["m3"])[:, 2]
+        stack_prob_out['m3_3'] = np.concatenate(stack_probs["m3"])[:, 3]
+        stack_prob_out['m3_4'] = np.concatenate(stack_probs["m3"])[:, 4]
+
+        stack_prob_out['m4_0'] = np.concatenate(stack_probs["m4"])[:, 0]
+        stack_prob_out['m4_1'] = np.concatenate(stack_probs["m4"])[:, 1]
+        stack_prob_out['m4_2'] = np.concatenate(stack_probs["m4"])[:, 2]
+        stack_prob_out['m4_3'] = np.concatenate(stack_probs["m4"])[:, 3]
+        stack_prob_out['m4_4'] = np.concatenate(stack_probs["m4"])[:, 4]
+
+        stack_prob_out.to_csv(f'train_stack_{len(models_name)}_models.csv', index=False)
 
     # opt_acc, opt_weight = optimize_weight(gts, preds, stype=args.stype)
- 
