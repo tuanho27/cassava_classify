@@ -5,6 +5,8 @@ import numpy as np
 from scipy.stats import beta
 
 def fmix(data, targets, alpha, decay_power, shape, device, max_soft=0.0, reformulate=False):
+    print(type(data))
+    print(type(targets))
     lam, mask = sample_mask(alpha, decay_power, shape, max_soft, reformulate)
     indices = torch.randperm(data.size(0))
     shuffled_data = data[indices]
